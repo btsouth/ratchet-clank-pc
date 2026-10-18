@@ -141,9 +141,9 @@ int main() {
     std::atomic<u32> built{0};
     const Vulkan::GraphicsPipeline::Deferral deferral{
         .submit =
-            [&](std::function<void()> job) {
+            [&](std::function<void()> job, bool urgent) {
                 std::scoped_lock lk{jobs_mutex};
-                jobs.push_back(std::move(job));
+                jobs.insert(urgent ? jobs.begin() : jobs.end(), std::move(job));
             },
         .built = [&](const Vulkan::GraphicsPipeline::SerializationSupport&) { ++built; },
     };
@@ -174,14 +174,38 @@ int main() {
     real_worker.join();
     assert(handle && !real->IsHandlePending() && built.load() == 1);
 
-    // A draw that waits anyway builds the pipeline itself when no worker has started it; the
-    // queued job then does nothing.
-    auto inline_built = make();
+    // A draw that waits puts its build ahead of the queued ones: a worker that runs only the
+    // first job builds it; the job queued first then does nothing.
+    auto queued_behind = make();
     shown->fetch_add(1);
-    const vk::Pipeline inline_handle = inline_built->HandleForDraw(false);
-    assert(inline_handle && !inline_built->IsHandlePending() && built.load() == 2);
+    std::thread first_job([&] {
+        std::this_thread::sleep_for(milliseconds(20));
+        std::function<void()> job;
+        {
+            std::scoped_lock lk{jobs_mutex};
+            assert(jobs.size() == 2);
+            job = std::move(jobs.front());
+            jobs.erase(jobs.begin());
+        }
+        job();
+    });
+    const vk::Pipeline expedited = queued_behind->HandleForDraw(false);
+    first_job.join();
+    assert(expedited && !queued_behind->IsHandlePending() && built.load() == 2);
     run_jobs_later(milliseconds(0)).join();
     assert(built.load() == 2);
+
+    // Missing in more than 3 shown frames, with no worker running: the draw builds it itself.
+    auto inline_built = make();
+    for (int frame = 0; frame < 3; ++frame) {
+        shown->fetch_add(1);
+        assert(!inline_built->HandleForDraw(true));
+    }
+    shown->fetch_add(1);
+    const vk::Pipeline inline_handle = inline_built->HandleForDraw(true);
+    assert(inline_handle && !inline_built->IsHandlePending() && built.load() == 3);
+    run_jobs_later(milliseconds(0)).join();
+    assert(built.load() == 3);
 
     // Destroying a pipeline whose build has not started returns at once; its job does nothing.
     auto dropped = make();
@@ -190,8 +214,9 @@ int main() {
     dropped.reset();
     assert(steady_clock::now() - drop_start < milliseconds(20));
     run_jobs_later(milliseconds(0)).join();
-    assert(built.load() == 2);
+    assert(built.load() == 3);
     inline_built.reset();
+    queued_behind.reset();
 
     real.reset();
     // Vulkan calls from this executable need their own dispatcher (libbbgpu.so has its own).
@@ -201,7 +226,8 @@ int main() {
     dispatch.init(instance.GetInstance());
     dispatch.init(device);
     device.destroyShaderModule(vs_module, nullptr, dispatch);
-    std::printf("Deferred GraphicsPipeline: built on the worker, bound after it; built inline "
-                "by a draw that needed it first; dropped before its build without one\n");
+    std::printf("Deferred GraphicsPipeline: built on the worker, bound after it; moved ahead "
+                "of the queue by a draw that waits; built by a draw once missing too long; "
+                "dropped before its build without one\n");
     return 0;
 }

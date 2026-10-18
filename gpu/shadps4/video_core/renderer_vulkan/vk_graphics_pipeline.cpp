@@ -85,14 +85,33 @@ GraphicsPipeline::GraphicsPipeline(
     job->num_modules = modules.size();
     job->sdata = sdata;
     job->built = deferral->built;
+    job->submit = deferral->submit;
     job->pipeline_cache = pipeline_cache;
     deferred = job;
     handle_pending.store(true, std::memory_order_release);
-    deferral->submit([this, job] {
-        if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
-            RunDeferred(*job);
-        }
-    });
+    deferral->submit(
+        [this, job] {
+            if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                RunDeferred(*job);
+            }
+        },
+        false);
+}
+
+void GraphicsPipeline::Expedite() const {
+    // A second job ahead of the queue: whichever runs first builds (the claim).
+    if (!deferred || deferred->claimed.load(std::memory_order_acquire) ||
+        deferred->expedited.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    auto* self = const_cast<GraphicsPipeline*>(this);
+    deferred->submit(
+        [self, job = deferred] {
+            if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                self->RunDeferred(*job);
+            }
+        },
+        true);
 }
 
 void GraphicsPipeline::RunDeferred(DeferredBuild& job) {

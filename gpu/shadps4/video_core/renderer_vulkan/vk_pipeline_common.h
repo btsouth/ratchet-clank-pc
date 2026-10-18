@@ -108,6 +108,8 @@ protected:
     virtual bool BuildNow() const {
         return false;
     }
+    /// Moves its build ahead of the queued ones, if it has not started.
+    virtual void Expedite() const {}
     /// Called by the worker once `pipeline` is set.
     void PublishHandle();
 

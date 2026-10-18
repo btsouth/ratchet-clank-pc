@@ -97,12 +97,8 @@ vk::Pipeline Pipeline::HandleForDrawSlow(bool recurring) const {
         g_bb_pipeline_wait_ns += ns;
         g_bb_compile_stall_ns += ns;
     };
-    // A draw that waits anyway takes its build if no worker has (it may be queued behind a
-    // hundred others): one compile, which the budget then counts.
-    if (!recurring && BuildNow()) {
-        charge();
-        return *pipeline;
-    }
+    // It may be queued behind a hundred others: the next free worker takes it.
+    Expedite();
     std::unique_lock lk{handle_mutex};
     const bool ready =
         handle_cv.wait_for(lk, std::chrono::nanoseconds(budget - used),

@@ -480,6 +480,11 @@ void PipelineCache::SaveDriverCache() {
     }
 }
 
+// bbport (diagnostics, the flip watchdog report): when the GPU thread's current compile began
+// (steady clock ns, 0: not compiling), and pipeline builds queued or running on workers.
+std::atomic<s64> g_bb_compiling_since_ns;
+std::atomic<u32> g_bb_pipeline_jobs;
+
 /// bbport BB_ASYNC_PIPELINES: worker threads creating graphics pipelines (the driver's compile,
 /// vkCreateGraphicsPipelines, with its own VkPipelineCache synchronization). Jobs run in order.
 class PipelineCompiler {
@@ -499,10 +504,16 @@ public:
             worker.join();
         }
     }
-    void Submit(std::function<void()> job) {
+    /// `urgent`: ahead of every queued job (a draw waits for it).
+    void Submit(std::function<void()> job, bool urgent = false) {
+        g_bb_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock lk{mutex};
-            jobs.push_back(std::move(job));
+            if (urgent) {
+                jobs.push_front(std::move(job));
+            } else {
+                jobs.push_back(std::move(job));
+            }
         }
         cv.notify_one();
     }
@@ -527,6 +538,7 @@ private:
                 ++running;
             }
             job();
+            g_bb_pipeline_jobs.fetch_sub(1, std::memory_order_relaxed);
             {
                 std::scoped_lock lk{mutex};
                 --running;
@@ -586,7 +598,15 @@ struct CompileTimer {
     const char* what = nullptr; // a pipeline: reported with its hash when profiled or slow
     u64 hash = 0;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    bool outermost = [this] {
+        s64 idle = 0;
+        return g_bb_compiling_since_ns.compare_exchange_strong(
+            idle, start.time_since_epoch().count(), std::memory_order_relaxed);
+    }();
     ~CompileTimer() {
+        if (outermost) {
+            g_bb_compiling_since_ns.store(0, std::memory_order_relaxed);
+        }
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - start)
                                .count());
@@ -794,7 +814,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             const auto queued = std::chrono::steady_clock::now();
             const GraphicsPipeline::Deferral deferral{
                 .submit =
-                    [this, queued, pipeline_hash](std::function<void()> job) {
+                    [this, queued, pipeline_hash](std::function<void()> job, bool urgent) {
                         compiler->Submit([job = std::move(job), queued, pipeline_hash] {
                             const auto start = std::chrono::steady_clock::now();
                             job();
@@ -809,7 +829,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                             ms(start, end), ms(queued, start));
                                 std::fflush(stdout);
                             }
-                        });
+                        }, urgent);
                     },
                 .built =
                     [key = sel.graphics_key, pipeline_hash](
