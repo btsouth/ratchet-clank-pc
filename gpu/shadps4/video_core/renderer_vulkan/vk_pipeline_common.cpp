@@ -60,7 +60,7 @@ vk::Pipeline Pipeline::HandleForDrawSlow(bool recurring) const {
     // for the previous frame's flip), which a cold cache missed: ~100 pipelines in one frame
     // at 50-140 ms each on NVIDIA.
     static const u64 recurring_ns = EnvNumber("BB_PIPELINE_WAIT_MS", 8) * 1'000'000;
-    static const u64 other_ns = EnvNumber("BB_PIPELINE_STALL_MS", 200) * 1'000'000;
+    static const u64 other_ns = EnvNumber("BB_PIPELINE_STALL_MS", 120) * 1'000'000;
     static const u64 max_frames = EnvNumber("BB_PIPELINE_SKIP_FRAMES", 60);
     const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
     bool overdue;

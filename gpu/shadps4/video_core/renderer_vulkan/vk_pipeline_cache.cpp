@@ -608,7 +608,7 @@ struct TranslationBudget {
             return (env && *env ? std::strtoull(env, nullptr, 10) : fallback) * 1'000'000;
         };
         static const u64 recurring_ns = env_ms("BB_SHADER_WAIT_MS", 16);
-        static const u64 other_ns = env_ms("BB_SHADER_FRAME_MS", 100);
+        static const u64 other_ns = env_ms("BB_SHADER_FRAME_MS", 60);
         const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
         if (shown != frame) {
             frame = shown;
