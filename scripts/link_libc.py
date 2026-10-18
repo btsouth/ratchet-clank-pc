@@ -139,6 +139,8 @@ def link(game, out):
                     struct.pack_into('<Q',image,target,symbol['value']+addend)
                 else:
                     relocs.append((target,0,base+symbol['value']+addend,0))
+            elif not symbol['identity'] and symbol['binding'] == 2:
+                struct.pack_into('<Q',image,target,0)  # weak undefined (module_start/stop)
             else:
                 rk = 2 if symbol['type']==1 else 1
                 if (rk==1 and addend) or not 0 <= addend < 4096:

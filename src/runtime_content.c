@@ -88,7 +88,9 @@ typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } Add
  * slots. */
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+    /* A game with several add-on services (LittleBigPlanet 3: SERVICE_ID_ADDCONT_ADD_1..7)
+     * asks per label: every add-on folder is listed whatever the label. */
+    if (service) { static int told; if (!told++) printf("Runtime: AppContent add-ons for service label %u\n",service); }
     if ((!capacity || !list) && !hits) return PARAMETER;
     int fill=list && capacity;
     uint32_t count=0;

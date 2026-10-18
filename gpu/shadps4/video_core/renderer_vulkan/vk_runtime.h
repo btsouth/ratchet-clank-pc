@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -95,6 +96,10 @@ public:
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
+    /// bbport (diagnostics, frame capture): writes mip 0 of `layer` (a volume: that slice) of
+    /// the image to `path` once the GPU has run the commands recorded so far. Returns the bytes.
+    u64 DumpImage(VideoCore::Image* image, u32 layer, const std::string& path);
+
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                       vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
 
@@ -120,6 +125,9 @@ public:
     }
 
 private:
+    void ClearVolumeSlices(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
+                           const vk::ClearValue& clear_value);
+
     void (*image_access_hook)(void*) = nullptr;
     void* image_access_context = nullptr;
     const Instance& instance;

@@ -14,7 +14,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // layer page-table pairs / guarded write-through stores
+static constexpr u32 ShaderBinaryVersion = 11u; // bbport: loop-free GS output vertex bound
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 6u; // bbport: rect/quad TCS reads only VS outputs
 } // namespace Serialization
@@ -59,15 +59,8 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
 }
 
-void RegisterShaderMeta(const Shader::Info& info,
-                        const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
-                        const Shader::StageSpecialization& spec, size_t perm_hash,
-                        size_t perm_idx) {
-    if (!Storage::DataBase::Instance().IsOpened()) {
-        return;
-    }
-
-    Serialization::Archive ar;
+void WriteShaderMeta(Serialization::Archive& ar, const Shader::Info& info,
+                     const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx) {
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
@@ -78,7 +71,18 @@ void RegisterShaderMeta(const Shader::Info& info,
 
     spec.Serialize(ar);
     info.Serialize(ar);
+}
 
+void RegisterShaderMeta(const Shader::Info& info,
+                        const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+                        const Shader::StageSpecialization& spec, size_t perm_hash,
+                        size_t perm_idx) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+
+    Serialization::Archive ar;
+    WriteShaderMeta(ar, info, spec, perm_hash, perm_idx);
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
                                        fmt::format("{:#018x}", perm_hash), ar.TakeOff());
 }
@@ -123,7 +127,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
-    fetch_shader_data = spec.fetch_shader_data;
+    // bbport: only the stage with a fetch shader (the first to run) sets it. Stages load in
+    // SwStage order, so a geometry shader loaded after the vertex shader reset it, and a cached
+    // pipeline drew with no vertex inputs (LBP3 VS afab4dd4, VUID-vkCmdDrawIndexed-Input-07939).
+    if (spec.fetch_shader_data) {
+        fetch_shader_data = spec.fetch_shader_data;
+    }
     return true;
 }
 

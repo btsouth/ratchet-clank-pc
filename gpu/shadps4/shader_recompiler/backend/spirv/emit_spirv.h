@@ -10,6 +10,9 @@
 
 namespace Shader::Backend::SPIRV {
 
+// A loop-free GS cannot emit more vertices than its static emission sites.
+[[nodiscard]] u32 GeometryOutputVertexLimit(const IR::Program& program, u32 declared);
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                                          const IR::Program& program, Bindings& binding);
 

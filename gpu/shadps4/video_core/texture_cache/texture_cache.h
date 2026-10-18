@@ -196,8 +196,9 @@ public:
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
-    /// Reuploads image contents.
-    void RefreshImage(Image& image);
+    /// Reuploads image contents. bbport: first_layer > 0 uploads only the layers from there on
+    /// (one mip level, not a volume or block format; ExpandImage copies the others).
+    void RefreshImage(Image& image, u32 first_layer = 0);
     void WatchImage(const Image& image, const char* what);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
@@ -447,6 +448,12 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    struct InvalidateMemo {
+        VAddr address = 0;
+        u64 size = 0;
+        u64 generation = ~0ULL;
+    };
+    std::array<InvalidateMemo, 256> invalidate_memo{}; ///< InvalidateMemoryFromGPU, under mutex
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     std::atomic<bool> downloads_queued{false}; ///< download_images may be non-empty (checked without the lock)

@@ -42,6 +42,7 @@ class StagingBufferPool;
 namespace VideoCore {
 
 class TextureCache;
+struct Image;
 class MemoryTracker;
 class PageManager;
 
@@ -67,9 +68,14 @@ public:
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
-    static constexpr u64 ARENA_PAGE_BITS = 32;
-    static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
-    static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
+    // bbport: arenas are 4 GiB sparse buffers where the device's sparse address space allows
+    // two of them (an arena grows to two pages), smaller otherwise (lavapipe: 2 GiB, 1 GiB pages).
+    static constexpr u64 MAX_ARENA_PAGE_BITS = 32;
+    static constexpr u64 MIN_ARENA_PAGE_BITS = 28;
+    static constexpr u64 MAX_NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - MIN_ARENA_PAGE_BITS);
+    u64 ARENA_PAGE_BITS = MAX_ARENA_PAGE_BITS;
+    u64 ARENA_PAGE_SIZE = u64{1} << MAX_ARENA_PAGE_BITS;
+    u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - MAX_ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
 
 public:
@@ -98,6 +104,11 @@ public:
     }
 
     /// Retrieves the stream buffer.
+    /// ObtainBuffer without writing rendered images inside the range to memory first: for a
+    /// caller that overwrites the whole range (a fill).
+    std::pair<const Buffer*, u64> ObtainBufferUnsynced(VAddr device_addr, u32 size,
+                                                       bool is_written, bool is_texel_buffer);
+
     StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
     }
@@ -372,6 +383,12 @@ private:
 
     /// The image at device_addr, if any, tiled into `buffer` at `offset` (where the range is).
     bool SynchronizeMemoryFromImage(const Buffer* buffer, u64 offset, VAddr device_addr, u32 size);
+    /// bbport: the same for any buffer binding over a whole image the GPU rendered and memory
+    /// does not have yet (a shader reading or read-modify-writing a render target as a buffer).
+    void SynchronizeRenderedImage(const Buffer* buffer, u64 offset, VAddr device_addr, u32 size);
+
+    /// Writes an image's contents into an arena at arena_offset (tiled as the game stores it).
+    bool WriteImageToMemory(Image& image, const Buffer* arena, u64 arena_offset);
     /// bbport BB_LAYER_MEMORY (statistics): a binding not whole in one chunk.
     void NoteLayerMiss(VAddr address, u64 size, bool is_written);
     /// bbport BB_LAYER_MEMORY (buffer_cache_layer.cpp): a binding through the layer's memory
@@ -454,6 +471,7 @@ private:
         u64 generation = ~0ULL;
     };
     std::array<ImageMiss, 256> image_miss_cache{};
+    std::array<ImageMiss, 256> rendered_miss_cache{}; ///< SynchronizeRenderedImage
     Vulkan::Runtime& runtime;
     Vulkan::StagingBufferPool& staging_pool;
     AmdGpu::Liverpool* liverpool;
@@ -468,7 +486,7 @@ private:
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
 
-    std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
+    std::array<const Buffer*, MAX_NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     std::mutex preupload_mutex;               ///< the map hooks come from guest threads

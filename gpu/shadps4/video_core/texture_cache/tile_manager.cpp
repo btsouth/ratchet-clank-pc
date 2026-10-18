@@ -33,6 +33,7 @@ struct TilingInfo {
     u32 micro_tiled_mips;
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
+    u32 first_texel;
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -225,7 +226,8 @@ void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::Descript
 }
 
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
-                                                       u64 in_offset, const ImageInfo& info) {
+                                                       u64 in_offset, const ImageInfo& info,
+                                                       u64 first_byte) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
@@ -242,6 +244,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
         }
     }
+    params.first_texel = static_cast<u32>(first_byte / (info.num_bits / 8));
 
     const vk::DescriptorBufferInfo params_buffer_info{
         .buffer = stream_buffer.Handle(),
@@ -264,7 +267,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .offset = staging.offset,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
+    const auto dim_x =
+        static_cast<u32>(((info.guest_size - first_byte) / (info.num_bits / 8)) / 64);
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);

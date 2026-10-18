@@ -3,8 +3,11 @@
 
 #include <chrono>
 #include <mutex>
+#include <unordered_map>
 #include <dlfcn.h>
 #include <map>
+#include <set>
+#include <tuple>
 #include <unordered_set>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
@@ -18,6 +21,7 @@
 #include "bbport_free_check.h"
 #include "bbport_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/fill_clear_value.h"
 #include "common/hash.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
@@ -1650,6 +1654,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
     }
+    if (!capture_dumps.empty()) {
+        FlushCaptureDumps(true);
+    }
     // bbport (BB_PREUPLOAD): once a frame, guest GPU memory the CPU wrote and then left alone is
     // uploaded ahead of its use, BB_PREUPLOAD_MB (16) at most per frame.
     if (const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
@@ -1837,6 +1844,23 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
     const auto* ps_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    // bbport BB_SKIP_PS=hash,... (diagnostics): draws with those pixel shaders (full 64-bit hash
+    // or its low 32 bits, hex) are not drawn, to see what a draw contributes.
+    static const std::vector<u64> skip_ps = [] {
+        std::vector<u64> out;
+        for (const char* p = std::getenv("BB_SKIP_PS"); p && *p;) {
+            char* end = nullptr;
+            out.push_back(std::strtoull(p, &end, 16));
+            p = end && *end == ',' ? end + 1 : nullptr;
+        }
+        return out;
+    }();
+    if (!skip_ps.empty() && ps_info &&
+        std::ranges::any_of(skip_ps, [&](u64 h) {
+            return h == ps_info->pgm_hash || h == (ps_info->pgm_hash & 0xffffffffull);
+        })) {
+        return;
+    }
     const Breadcrumbs::Crumb crumb{
         .kind = is_indexed ? Breadcrumbs::Kind::DrawIndexed : Breadcrumbs::Kind::Draw,
         .hash = {vs_info.pgm_hash, ps_info ? ps_info->pgm_hash : 0},
@@ -1857,6 +1881,40 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
+        // bbport BB_CAPTURE_DRAWS_OF=N (with BB_CAPTURE_IMAGES): color 0 after each draw of
+        // pass N of the captured frame, pNNN_dDDD_<ps>_....
+        static const long draws_of = [] {
+            const char* env = std::getenv("BB_CAPTURE_DRAWS_OF");
+            return env ? std::strtol(env, nullptr, 0) : -1L;
+        }();
+        // A value of 0x10000 or more is the address of the color 0 target instead.
+        const bool draw_target_match =
+            draws_of >= 0x10000
+                ? cb_descs[0].first &&
+                      texture_cache.GetImage(cb_descs[0].first).info.guest_address ==
+                          VAddr(draws_of)
+                : FrameCapture::LastEntry() == u32(draws_of);
+        if (draws_of >= 0 && FrameCapture::DumpingImages() && draw_target_match &&
+            cb_descs[0].first) {
+            static u32 draw_index = 0;
+            static const std::string dir = [] {
+                const char* env = std::getenv("BB_CAPTURE_DIR");
+                return std::string{env ? env : "."};
+            }();
+            for (u32 cb = 0; cb < 2 && cb < state.num_color_attachments; ++cb) {
+                if (!cb_descs[cb].first) {
+                    continue;
+                }
+                auto& image = texture_cache.GetImage(cb_descs[cb].first);
+                capture_dump_bytes += runtime.DumpImage(
+                    &image, 0,
+                    fmt::format("{}/p{:03}_d{:03}_c{}_{:08x}_{}x{}_{}.raw", dir,
+                                FrameCapture::LastEntry(), draw_index, cb,
+                                u32(ps ? ps->pgm_hash : 0), image.info.size.width,
+                                image.info.size.height, vk::to_string(image.info.pixel_format)));
+            }
+            ++draw_index;
+        }
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -1912,6 +1970,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
+    }
+    if (!capture_dumps.empty()) {
+        FlushCaptureDumps(true);
     }
     const VAddr count_address = indirect.count;
     const u32 stride = indirect.stride;
@@ -2061,6 +2122,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     gbuffer_draw = false;
 
     scheduler.PopPendingOperations();
+    if (!capture_dumps.empty()) {
+        FlushCaptureDumps(false);
+    }
 
     const auto& cs_program = CsRegs();
 
@@ -2452,8 +2516,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     {
         // bbport BB_HLE_STATS=1 (diagnostics): how often the compute shader substitutions fire.
         static const bool hle_stats = std::getenv("BB_HLE_STATS") != nullptr;
-        // BB_HLE_OFF=mask (experiment): 1 image copy, 2 metadata clear, 4 image clear run as the
-        // game's shaders.
+        // BB_HLE_OFF=mask (experiment): 1 image copy, 2 metadata clear, 4 image clear, 8 masked
+        // fill run as the game's shaders.
         static const u32 hle_off = [] {
             const char* env = std::getenv("BB_HLE_OFF");
             return env ? u32(std::strtoul(env, nullptr, 0)) : 0u;
@@ -2465,17 +2529,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         const int which = !(hle_off & 1) && IsComputeImageCopy(pipeline)   ? 1
                           : !(hle_off & 2) && IsComputeMetaClear(pipeline) ? 2
                           : !(hle_off & 4) && IsComputeImageClear(pipeline) ? 3
+                          : !(hle_off & 8) && IsComputeMaskedFill(pipeline)  ? 4
                                                                              : 0;
         if (hle_stats) {
-            static std::array<u64, 4> counts{};
+            static std::array<u64, 5> counts{};
             static auto last = std::chrono::steady_clock::now();
             ++counts[which];
             if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
                 last = std::chrono::steady_clock::now();
                 std::printf("HLE stats (5 s): image copy %llu, meta clear %llu, image clear %llu, "
-                            "other binds %llu\n",
+                            "masked fill %llu, other binds %llu\n",
                             (unsigned long long)counts[1], (unsigned long long)counts[2],
-                            (unsigned long long)counts[3], (unsigned long long)counts[0]);
+                            (unsigned long long)counts[3], (unsigned long long)counts[4],
+                            (unsigned long long)counts[0]);
                 counts = {};
             }
         }
@@ -2715,8 +2781,62 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     }
 
     if (bindings.empty()) {
-        // If there are no bindings, there is nothing further to do.
+        // bbport: a vertex shader with a fetch shader declares inputs; none bound leaves them
+        // undefined (VUID-vkCmdDrawIndexed-Input-07939).
+        if (const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex); vs.has_fetch_shader) {
+            static std::atomic<u32> warned{0};
+            if (warned.fetch_add(1) < 16) {
+                std::printf("GPU: vertex shader %016llx has a fetch shader but no vertex inputs "
+                            "(pipeline fetch data %s, prepared %s)\n",
+                            (unsigned long long)vs.pgm_hash, fetch ? "yes" : "no",
+                            ready ? "yes" : "no");
+            }
+        }
         return;
+    }
+    // bbport BB_LOG_VERTEX=vs_hash (diagnostics, hex, low 32 bits allowed): the vertex inputs of
+    // that shader's first 8 draws: V# format, stride, address, Vulkan format, first element.
+    static const u64 log_vertex = [] {
+        const char* env = std::getenv("BB_LOG_VERTEX");
+        return env ? std::strtoull(env, nullptr, 16) : 0ull;
+    }();
+    if (log_vertex) {
+        const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+        static u32 logged = 0;
+        if ((vs.pgm_hash == log_vertex || (vs.pgm_hash & 0xffffffffull) == log_vertex) &&
+            logged < 8) {
+            ++logged;
+            for (size_t i = 0; i < attributes.size() && i < guest_buffers.size(); ++i) {
+                const auto& vb = guest_buffers[i];
+                std::string line = fmt::format(
+                    "Vertex {:016x}: loc {} dfmt {} nfmt {} -> {}, stride {}, at {:#x} size {}",
+                    vs.pgm_hash, attributes[i].location, u32(vb.GetDataFmt()),
+                    u32(vb.GetNumberFmt()), vk::to_string(attributes[i].format), vb.GetStride(),
+                    vb.base_address, vb.GetSize());
+                if (fetch && i < fetch->attributes.size()) {
+                    const auto& fa = fetch->attributes[i];
+                    line += fmt::format(" (v{} x{}, inst offset {}, instance {}, fmt {}/{})",
+                                        fa.dest_vgpr, fa.num_elements, fa.inst_offset,
+                                        fa.instance_data, fa.data_format, fa.num_format);
+                }
+                line += ":";
+                if (vb.base_address && memory->IsValidGpuMapping(vb.base_address, 0)) {
+                    const auto* w = reinterpret_cast<const u32*>(vb.base_address);
+                    for (u32 k = 0; k < std::min<u32>(4, vb.GetStride() / 4); ++k) {
+                        line += fmt::format(" {:08x}", w[k]);
+                    }
+                }
+                std::printf("%s\n", line.c_str());
+            }
+            const auto& regs = Regs();
+            std::string ps = fmt::format("Vertex {:016x}: PS inputs", vs.pgm_hash);
+            for (u32 i = 0; i < regs.num_interp; ++i) {
+                const auto& in = regs.ps_inputs[i];
+                ps += fmt::format(" [{}]=param{}{}{}", i, u32(in.input_offset),
+                                  in.use_default ? " default" : "", in.flat_shade ? " flat" : "");
+            }
+            std::printf("%s\n", ps.c_str());
+        }
     }
     if (motion_draw && !guest_buffers.empty()) {
         // Include every stream: identical position buffers can be paired with different
@@ -2884,6 +3004,42 @@ size_t ShaderBufferCount(const Shader::Info& info) {
 }
 } // namespace
 
+namespace {
+// bbport BB_RANGE_LOG=lo,hi (diagnostics): every GPU write overlapping [lo, hi): render targets,
+// storage buffer bindings, fills and copies, with the frame-capture entry and a detail: the
+// shader hash of a binding, the attachment index of a target, a fill's value, a copy's source.
+void RangeLog(const char* what, VAddr addr, u64 size, u64 detail) {
+    static const std::pair<u64, u64> range = [] {
+        const char* env = std::getenv("BB_RANGE_LOG");
+        if (!env) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* end = nullptr;
+        const u64 lo = std::strtoull(env, &end, 0);
+        const u64 hi = end && *end == ',' ? std::strtoull(end + 1, nullptr, 0) : lo + 1;
+        return std::pair<u64, u64>{lo, hi};
+    }();
+    if (range.second == 0 || addr >= range.second || addr + size <= range.first) {
+        return;
+    }
+    // Each distinct write is printed its first 4 times.
+    static std::mutex mutex;
+    static std::unordered_map<u64, u32> seen;
+    {
+        std::scoped_lock lk{mutex};
+        const u64 key = addr ^ (size << 20) ^ (detail * 0x9e3779b97f4a7c15ull) ^ u64(what[0]) << 56;
+        if (++seen[key] > 4 || seen.size() > 4000) {
+            return;
+        }
+    }
+    {
+        std::printf("Range write: %s %#llx+%#llx (%#llx) entry %u\n", what,
+                    (unsigned long long)addr, (unsigned long long)size, (unsigned long long)detail,
+                    FrameCapture::LastEntry());
+    }
+}
+} // namespace
+
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     if (!pipeline->IsCompute()) {
         return false;
@@ -3047,6 +3203,204 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     runtime.ClearImage(&image1, range, clear);
+    return true;
+}
+
+std::optional<u32> Rasterizer::ReadStageDword(const Shader::Info& info, u32 index, u32 offset) {
+    const auto& desc = info.buffers[index];
+    if (const RingBinding* ring = num_ring_stages ? FindRingBinding(info, index) : nullptr) {
+        if (offset + 4 > ring->size) {
+            return std::nullopt;
+        }
+        u32 value;
+        std::memcpy(&value, constant_ring->Data(ring->offset) + offset, sizeof(value));
+        return value;
+    }
+    const AmdGpu::Buffer sharp = desc.GetSharp(info);
+    const VAddr address = sharp.base_address + offset;
+    if (sharp.base_address == 0 || offset + 4 > sharp.GetSize() ||
+        !memory->IsValidGpuMapping(address, 4) || buffer_cache.IsRegionGpuModified(address, 4)) {
+        return std::nullopt;
+    }
+    u32 value;
+    std::memcpy(&value, std::bit_cast<const void*>(address), sizeof(value));
+    return value;
+}
+
+
+bool Rasterizer::IsComputeMaskedFill(const Pipeline* pipeline) {
+    // bbport: a compute shader that fills memory under a mask, one dword per thread:
+    //   i = group * 64 + thread; if (i < cb[0] && i < user data 14)
+    //       dst[i] = dst[i] & ~mask[i & cb[1]] | value[i & cb[1]] & mask[i & cb[1]]
+    // (buffers: cb, mask, dst, value). LBP3 clears its two 16 MB light atlases with it in one
+    // 64 MB dispatch every frame. Run as itself, it needs the rendered atlases in memory first
+    // and reuploads them after: 32 MB each way per frame. With a full mask it is a plain fill:
+    // the memory is filled on the GPU and the images wholly inside it are cleared, nothing is
+    // read back. Other masks (the scene alpha clear) run as the shader. The program is known by
+    // its hash; the binding layout is checked as well.
+    static constexpr std::array<u64, 1> MaskedFillShaders = {0x079cfe79e0ada38cull};
+    if (!pipeline->IsCompute()) {
+        return false;
+    }
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    if (std::ranges::find(MaskedFillShaders, info.pgm_hash) == MaskedFillShaders.end()) {
+        return false;
+    }
+    const auto& cs_pgm = CsRegs();
+    static const bool log = std::getenv("BB_MASKED_FILL_LOG") != nullptr;
+    if (log) {
+        static std::atomic<u32> printed{0};
+        if (printed++ < 4) {
+            std::string text;
+            for (const auto& desc : info.buffers) {
+                const auto sharp = desc.GetSharp(info);
+                text += fmt::format(" [{} special {} written {} formatted {} at {:#x} size {} "
+                                    "stride {}]",
+                                    u32(desc.buffer_type), desc.IsSpecial(), desc.is_written,
+                                    desc.is_formatted, sharp.base_address, sharp.GetSize(),
+                                    sharp.GetStride());
+            }
+            std::printf("Masked fill: cs threads %ux%ux%u groups %ux%ux%u, %zu images, user "
+                        "data %zu, ring stages %u, buffers%s\n",
+                        cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
+                        cs_pgm.num_thread_z.full, cs_pgm.dim_x, cs_pgm.dim_y, cs_pgm.dim_z,
+                        info.images.size(), info.UserData().size(), num_ring_stages,
+                        text.c_str());
+        }
+    }
+    if (cs_pgm.num_thread_x.full != 64 || cs_pgm.num_thread_y.full != 1 ||
+        cs_pgm.num_thread_z.full != 1 || cs_pgm.dim_y != 1 || cs_pgm.dim_z != 1 ||
+        ShaderBufferCount(info) != 4 || info.buffers.size() != 4 || !info.images.empty()) {
+        return false;
+    }
+    // The destination is a raw or a 32-bit formatted buffer (the shader moves whole dwords).
+    const auto& dst_desc = info.buffers[2];
+    if (!dst_desc.is_written || info.buffers[0].is_written || info.buffers[1].is_written ||
+        info.buffers[3].is_written) {
+        return false;
+    }
+    if (dst_desc.is_formatted) {
+        const auto dst_sharp = dst_desc.GetSharp(info);
+        const auto nfmt = dst_sharp.GetNumberFmt();
+        if (dst_sharp.GetDataFmt() != AmdGpu::DataFormat::Format32 ||
+            (nfmt != AmdGpu::NumberFormat::Float && nfmt != AmdGpu::NumberFormat::Uint &&
+             nfmt != AmdGpu::NumberFormat::Sint)) {
+            return false;
+        }
+    }
+    const auto count = ReadStageDword(info, 0, 0);
+    const auto period = ReadStageDword(info, 0, 4);
+    const auto mask = ReadStageDword(info, 1, 0);
+    const auto value = ReadStageDword(info, 3, 0);
+    const auto user_data = info.UserData();
+    if (log) {
+        static std::atomic<u32> printed{0};
+        if (printed++ < 4) {
+            std::printf("Masked fill: count %s period %s mask %s value %s ud14 %s\n",
+                        count ? fmt::format("{:#x}", *count).c_str() : "?",
+                        period ? fmt::format("{:#x}", *period).c_str() : "?",
+                        mask ? fmt::format("{:#x}", *mask).c_str() : "?",
+                        value ? fmt::format("{:#x}", *value).c_str() : "?",
+                        user_data.size() > 14 ? fmt::format("{:#x}", user_data[14]).c_str() : "?");
+        }
+    }
+    if (!count || !period || !mask || !value || user_data.size() <= 14 || *period != 0) {
+        return false;
+    }
+    const AmdGpu::Buffer dst = dst_desc.GetSharp(info);
+    const u64 threads = u64(cs_pgm.dim_x) * 64;
+    const u64 dwords = std::min({u64(*count), u64(user_data[14]), threads});
+    const u64 bytes = std::min<u64>(dwords * 4, dst.GetSize());
+    if (dst.GetStride() != 4 || dst.base_address == 0 || dst.base_address % 4 != 0 ||
+        bytes % 4 != 0) {
+        return false;
+    }
+    if (*mask == 0 || bytes == 0) {
+        return true; // writes back what it read
+    }
+    if (*mask != ~0u) {
+        static std::atomic<u32> printed{0};
+        if (log && printed++ < 8) {
+            std::printf("Masked fill: %#llx+%#llx mask %#x value %#x: the shader\n",
+                        (unsigned long long)dst.base_address, (unsigned long long)bytes, *mask,
+                        *value);
+        }
+        return false;
+    }
+    const VAddr begin = dst.base_address;
+    const VAddr end = begin + bytes;
+    // The color images wholly inside are cleared to the color whose bytes are the value (where
+    // the format gives them exactly); images partly inside keep their contents, as a storage
+    // write leaves them (InvalidateMemoryFromGPU).
+    // The texture binding helper may still be adding images (it can move them in memory):
+    // it finishes before the lookup, as before any change of image state.
+    runtime.BeforeImageAccess();
+    boost::container::small_vector<std::pair<VideoCore::ImageId, vk::ClearValue>, 16> inside;
+    bool clearable = true;
+    std::string blocker;
+    texture_cache.ForEachImageInRegion(begin, bytes, [&](VideoCore::ImageId id,
+                                                         VideoCore::Image& image) {
+        // Placeholders (the stencil address of a depth buffer) have no contents.
+        if (image.info.guest_address < begin ||
+            image.info.guest_address + image.info.guest_size > end ||
+            image.info.pixel_format == vk::Format::eUndefined) {
+            return;
+        }
+        // A depth buffer in the range (LBP3's aliases a light atlas) clears to 0 exactly.
+        if (image.info.props.is_depth && *value == 0 &&
+            !texture_cache.IsMeta(image.info.guest_address)) {
+            inside.emplace_back(id, vk::ClearValue{.depthStencil = {.depth = 0.0f, .stencil = 0}});
+            return;
+        }
+        const auto color = FillClearValue(image.info.pixel_format, *value);
+        if (!color || image.info.props.is_depth || image.info.props.is_block ||
+            (*value != 0 && image.info.num_bits != 32) ||
+            texture_cache.IsMeta(image.info.guest_address)) {
+            if (clearable) {
+                blocker = fmt::format(" (not clearable: {:#x} {} {}x{} depth {} meta {})",
+                                      image.info.guest_address,
+                                      vk::to_string(image.info.pixel_format), image.info.size.width,
+                                      image.info.size.height, bool(image.info.props.is_depth),
+                                      texture_cache.IsMeta(image.info.guest_address).has_value());
+            }
+            clearable = false;
+            return;
+        }
+        inside.emplace_back(id, vk::ClearValue{.color = *color});
+    });
+    // BB_MASKED_FILL_LOG=1 (diagnostics): the first 32 distinct fills.
+    if (log) {
+        static std::atomic<u32> printed{0};
+        static std::mutex mutex;
+        static std::set<std::tuple<VAddr, u64, u32, u32>> seen;
+        std::scoped_lock lk{mutex};
+        if (seen.emplace(begin, bytes, *mask, *value).second && printed++ < 32) {
+            std::printf("Masked fill: %#llx+%#llx mask %#x value %#x, %zu images inside: %s%s\n",
+                        (unsigned long long)begin, (unsigned long long)bytes, *mask, *value,
+                        inside.size(), clearable ? "fill and clears" : "the shader",
+                        blocker.c_str());
+        }
+    }
+    if (!clearable) {
+        return false;
+    }
+    RangeLog("masked fill", begin, bytes, *value);
+    if (FrameCapture::Active()) {
+        FrameCapture::Note(fmt::format("\n  masked fill cs {:016x}: {:#x}+{:#x} = {:#x}, {} "
+                                       "images cleared",
+                                       info.pgm_hash, begin, bytes, *value, inside.size())
+                               .c_str());
+    }
+    const auto [buffer, offset] = buffer_cache.ObtainBufferUnsynced(begin, u32(bytes), true, false);
+    runtime.FillBuffer(buffer, offset, bytes, *value);
+    for (const auto& [id, clear] : inside) {
+        auto& image = texture_cache.GetImage(id);
+        const VideoCore::SubresourceRange range = {.base = {.level = 0, .layer = 0},
+                                                   .extent = image.info.resources};
+        runtime.ClearImage(&image, range, clear);
+        // Memory holds the same texels: nothing to write back or upload.
+        image.flags &= ~VideoCore::ImageFlagBits::GpuModified;
+    }
     return true;
 }
 
@@ -3305,6 +3659,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     std::min<u64>(size + adjust, buffer->SizeBytes() - offset_aligned));
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (desc.is_written) {
+                    RangeLog("buffer", vsharp.base_address, size, stage.pgm_hash);
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
@@ -3622,6 +3977,36 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             image.usage.texture |= !is_storage;
             if (FrameCapture::Active()) {
                 FrameCapture::Sampled(image.info, is_storage, &desc.view_info);
+                // The T# when it describes another image than the one bound.
+                if (desc.info.size.width != image.info.size.width ||
+                    desc.info.size.height != image.info.size.height ||
+                    desc.info.pixel_format != image.info.pixel_format ||
+                    desc.info.tile_mode != image.info.tile_mode) {
+                    char note[160];
+                    std::snprintf(note, sizeof(note),
+                                  "\n  T# %#llx is %ux%u fmt %u tile %u, bound image %ux%u fmt %u "
+                                  "tile %u",
+                                  (unsigned long long)desc.info.guest_address,
+                                  desc.info.size.width, desc.info.size.height,
+                                  u32(desc.info.pixel_format), u32(desc.info.tile_mode),
+                                  image.info.size.width, image.info.size.height,
+                                  u32(image.info.pixel_format), u32(image.info.tile_mode));
+                    FrameCapture::Note(note);
+                }
+                if (is_storage && FrameCapture::DumpingImages()) {
+                    // Written by this draw or dispatch: out after it (entry: see Dispatch).
+                    capture_dumps.push_back({image_id, image.image_uid, ~0u, 16 + binding_index,
+                                             desc.view_info.range.base.layer});
+                    capture_dump_key = ~0ull;
+                } else if (!is_storage && FrameCapture::DumpingImages() &&
+                           FrameCapture::DumpingSampled() &&
+                           std::ranges::find(capture_sampled, image.info.guest_address) ==
+                               capture_sampled.end()) {
+                    // BB_CAPTURE_IMAGES=2: each texture once per captured frame, as sampled.
+                    capture_sampled.push_back(image.info.guest_address);
+                    capture_dumps.push_back({image_id, image.image_uid, ~0u, 64 + binding_index,
+                                             desc.view_info.range.base.layer});
+                }
             }
 
             vk::ImageView view = *image_view.image_view;
@@ -4005,6 +4390,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        RangeLog(is_clear ? "color (fast clear)" : "color", image->info.guest_address,
+                 image->info.guest_size, cb);
 
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
@@ -4212,6 +4599,22 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto* depth =
             db_desc.first ? &texture_cache.GetImage(db_desc.first).info : nullptr;
         FrameCapture::BeginPass(colors.data(), state.num_color_attachments, depth);
+        if (FrameCapture::DumpingImages() && capture_dumps.empty()) {
+            const u32 entry = FrameCapture::LastEntry();
+            for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                if (cb_descs[cb].first) {
+                    capture_dumps.push_back({cb_descs[cb].first,
+                                             texture_cache.GetImage(cb_descs[cb].first).image_uid,
+                                             entry, cb,
+                                             cb_descs[cb].second.view_info.range.base.layer});
+                }
+            }
+            if (db_desc.first) {
+                capture_dumps.push_back(
+                    {db_desc.first, texture_cache.GetImage(db_desc.first).image_uid, entry, 8, 0});
+            }
+            capture_dump_key = CapturePassKey();
+        }
     }
     // bbport: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
@@ -4268,6 +4671,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
+        RangeLog("fill", address, num_bytes, value);
         texture_cache.ClearMeta(address);
         // bbport BB_GUEST_IN_PLACE: memory the GPU uses in place is filled by the GPU in stream order
         // (a fill on the CPU now would land before earlier draws read the old data). Elsewhere
@@ -4308,6 +4712,9 @@ bool Rasterizer::DmaMayWriteOnCpu(VAddr dst, u32 num_bytes) {
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
+    if (!dst_gds) {
+        RangeLog("copy", dst, num_bytes, src);
+    }
     // bbport BB_GUEST_IN_PLACE: see FillBuffer (in place: the GPU, in stream order).
     if (!dst_gds && !buffer_cache.IsAnyInPlace(dst, num_bytes) &&
         !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
@@ -4904,6 +5311,64 @@ void Rasterizer::NoteFrameStart() {
         }
         std::printf("\n");
         lag_histogram = {};
+    }
+}
+
+u64 Rasterizer::CapturePassKey() const {
+    const auto& regs = Regs();
+    u64 key = regs.depth_buffer.DepthAddress() * 31;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        if (regs.color_buffers[cb]) {
+            key = key * 1000003 ^ (regs.color_buffers[cb].Address() + cb);
+        }
+    }
+    return key;
+}
+
+void Rasterizer::FlushCaptureDumps(bool pass_continues) {
+    // Draws into the same targets continue the pass; anything else ends it.
+    if (pass_continues && capture_dump_key == CapturePassKey()) {
+        return;
+    }
+    static const std::string dir = [] {
+        const char* env = std::getenv("BB_CAPTURE_DIR");
+        return std::string{env ? env : "."};
+    }();
+    static const u64 budget = [] {
+        const char* env = std::getenv("BB_CAPTURE_IMAGES_MB");
+        return (env ? std::strtoull(env, nullptr, 10) : 1536ull) << 20;
+    }();
+    // BB_CAPTURE_IMAGES_AT=addr: only the image at that address.
+    static const VAddr only = [] {
+        const char* env = std::getenv("BB_CAPTURE_IMAGES_AT");
+        return env ? VAddr(std::strtoull(env, nullptr, 0)) : VAddr{0};
+    }();
+    const u32 last = FrameCapture::LastEntry();
+    for (const auto& d : capture_dumps) {
+        auto* found = d.id ? texture_cache.TryGetImage(d.id, d.uid) : nullptr;
+        if (!found) {
+            continue; // freed since
+        }
+        auto& image = *found;
+        const auto& info = image.info;
+        if (only && info.guest_address != only) {
+            continue;
+        }
+        if (capture_dump_bytes > budget) {
+            break;
+        }
+        const std::string path = fmt::format(
+            "{}/p{:03}_{}{}_{:#x}_{}x{}_{}.raw", dir, d.entry == ~0u ? last : d.entry,
+            d.slot == 8 ? "depth" : d.slot >= 64 ? "tex" : d.slot >= 16 ? "storage" : "color",
+            d.slot == 8 ? 0 : d.slot >= 64 ? d.slot - 64 : d.slot % 16, info.guest_address,
+            info.size.width, info.size.height,
+            vk::to_string(info.pixel_format));
+        capture_dump_bytes += runtime.DumpImage(&image, d.layer, path);
+    }
+    capture_dumps.clear();
+    if (!FrameCapture::DumpingImages()) {
+        capture_dump_bytes = 0;
+        capture_sampled.clear();
     }
 }
 

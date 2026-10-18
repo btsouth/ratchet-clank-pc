@@ -293,6 +293,10 @@ void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage,
     }
 }
 
+u32 FrameCapture::LastEntry() {
+    return entries.empty() ? 0 : u32(entries.size() - 1);
+}
+
 void FrameCapture::Note(const char* text) {
     if (!entries.empty()) {
         entries.back().note += text;

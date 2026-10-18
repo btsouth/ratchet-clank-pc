@@ -104,6 +104,7 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint micro_tiled_mips;
     uint num_mips;
     MipInfo mips[16];
+    uint first_texel; // bbport: detiling starts here (the layers an expanded image added)
 } info;
 
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z, uint32_t thickness) {
@@ -425,7 +426,8 @@ uint GetMipLevel(inout uint texel) {
 }
 
 void main() {
-    uint texel = gl_GlobalInvocationID.x;
+    const uint linear_index = gl_GlobalInvocationID.x + info.first_texel;
+    uint texel = linear_index;
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
@@ -445,8 +447,8 @@ void main() {
 #endif
 
     if (IS_TILER != 0) {
-        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[linear_index];
     } else {
-        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+        linear_data[linear_index] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
     }
 }

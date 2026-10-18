@@ -36,6 +36,8 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -260,7 +262,11 @@ static void report_guest_heap(void) {
     if (!enabled || now-last<5000000) return;
     last=now;
     const uint8_t *stub=(const uint8_t *)(0x800000000ull+0x56e0000+0x1f8c0);
-    if (stub[0]!=0xff || stub[1]!=0x25) return; /* another libc */
+    /* Another game's image may not reach this far: read the stub without faulting. */
+    uint8_t code[2]={0,0};
+    struct iovec local={code,sizeof(code)}, remote={(void *)stub,sizeof(code)};
+    if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(code)) { enabled=0; return; }
+    if (code[0]!=0xff || code[1]!=0x25) { enabled=0; return; } /* another libc */
     ABI int (*stats)(MallocManagedSize *)=(ABI int (*)(MallocManagedSize *))(uintptr_t)stub;
     MallocManagedSize m={.size=sizeof(m),.version=1};
     const int result=stats(&m);

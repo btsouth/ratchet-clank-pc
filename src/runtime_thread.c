@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -160,6 +161,12 @@ static ABI int32_t attr_set_stack(ThreadAttr **slot,uint64_t size) {
     if (!a || size<16384) return ERR(22);
     a->stack=size; return 0;
 }
+/* scePthreadAttrSetstack: the game's own stack area. Its size is kept; the thread runs on a
+ * stack of that size from the runtime (glibc would put its thread descriptor into the area). */
+static ABI int32_t attr_set_stack_area(ThreadAttr **slot,void *address,uint64_t size) {
+    if (!address) return ERR(22);
+    return attr_set_stack(slot,size);
+}
 static ABI int32_t attr_get_stack(ThreadAttr **slot,uint64_t *size) {
     ThreadAttr *a=find_attr(slot);
     if (!a || !size) return ERR(22);
@@ -217,8 +224,16 @@ static void set_host_name(const char *name) {
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
 }
+/* The fault report runs on its own stack: a guest thread's small stack (or an overflow of it)
+ * would otherwise fault again inside the handler and end the process without a report. */
+void runtime_thread_alt_stack(void) {
+    enum { ALT_STACK=256*1024 };
+    stack_t alt={.ss_sp=malloc(ALT_STACK),.ss_size=ALT_STACK};
+    if (alt.ss_sp) sigaltstack(&alt,NULL);
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
+    runtime_thread_alt_stack();
     attach(t);
     set_host_name(t->name);
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
@@ -304,6 +319,16 @@ static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
     if (!find_thread(t)) return ERR(3);
     t->attr.prio=prio; return 0;
 }
+static ABI int32_t thread_get_sched(GuestThread *t,int *policy,int *param) {
+    if (!find_thread(t)) return ERR(3);
+    if (!policy || !param) return ERR(22);
+    *policy=t->attr.policy; *param=t->attr.prio; return 0;
+}
+static ABI int32_t thread_set_sched(GuestThread *t,int policy,const int *param) {
+    if (!find_thread(t)) return ERR(3);
+    if (!param || policy<1 || policy>3) return ERR(22);
+    t->attr.policy=policy; t->attr.prio=*param; return 0;
+}
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
     if (!find_thread(t)) return ERR(3);
     t->attr.affinity=mask; return 0;
@@ -351,7 +376,7 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"9BcDykPmo1I#p#J",guest_error},
         {"nsYoNRywwNg#p#J",attr_init}, {"62KCwEMmzcM#p#J",attr_destroy},
         {"x1X76arYMxU#p#J",attr_get}, {"8+s5BzZjxSg#p#J",attr_affinity},
-        {"UTXzJbWhhTE#p#J",attr_set_stack}, {"-Wreprtu0Qs#p#J",attr_set_detach},
+        {"UTXzJbWhhTE#p#J",attr_set_stack}, {"Bvn74vj6oLo#p#J",attr_set_stack_area}, {"-Wreprtu0Qs#p#J",attr_set_detach},
         {"4+h9EzwKF4I#p#J",attr_set_policy}, {"DzES9hQF4f4#p#J",attr_set_param},
         {"3qxgM4ezETA#p#J",attr_set_affinity}, {"eXbUSpEaTsA#p#J",attr_set_inherit},
         {"JaRMy+QcpeU#p#J",attr_get_detach}, {"-fA+7ZlGDQs#p#J",attr_get_stack},
@@ -359,6 +384,7 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"6UgtwV+0zb4#p#J",thread_create}, {"onNY9Byn-W8#p#J",thread_join},
         {"4qGrR6eoP9Y#p#J",thread_detach}, {"3kg7rT0NQIs#p#J",thread_exit},
         {"T72hz6ffq08#p#J",thread_yield}, {"1tKyG7RlMJo#p#J",thread_get_prio},
+        {"P41kTWUS3EI#p#J",thread_get_sched}, {"oIRFTjoILbg#p#J",thread_set_sched},
         {"W0Hpm2X0uPE#p#J",thread_set_prio}, {"bt3CTBKmGyI#p#J",thread_set_affinity}, {"rcrVFJsQWRY#p#J",thread_get_affinity},
         {"GBUY7ywdULE#p#J",thread_rename}, {"3PtV6p3QNX4#p#J",thread_equal},
         {"wtkt-teR1so#I#J",posix_attr_init}, {"zHchY8ft5pk#I#J",posix_attr_destroy},
@@ -380,5 +406,6 @@ void runtime_thread_report(void) {
 uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
 void runtime_thread_report(void) {}
 void runtime_thread_attach_main(void) {}
+void runtime_thread_alt_stack(void) {}
 void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
 #endif

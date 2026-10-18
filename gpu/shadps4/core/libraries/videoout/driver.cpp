@@ -22,6 +22,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/flip_trace.h"
 #include "core/libraries/kernel/equeue.h"
 
 extern "C" void runtime_sleep_stats(uint64_t* calls, uint64_t* ns);
@@ -368,6 +369,14 @@ static void PrintMemory() {
                 (unsigned long long)BbStats::gc_kept_images.exchange(0));
 }
 
+namespace {
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
@@ -445,6 +454,9 @@ void VideoOutDriver::Flip(const Request& req) {
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
+        if (frame_ms > 1500.0 && std::getenv("BB_FLIP_TRACE_STALLS")) {
+            FlipTrace::Dump();
+        }
         if (frame_ms > 40.0 && last_gpu_ns != 0) {
             std::printf("Stall: %.1f ms frame; GPU thread on CPU %.1f ms; %llu images registered, "
                         "%.1f MB image uploads, %.1f MB buffer uploads\n",
@@ -749,6 +761,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Update flip status.
+    last_flip_ns.store(NowNs(), std::memory_order_relaxed);
     auto* port = req.port;
     {
         std::unique_lock lock{port->port_mutex};
@@ -764,6 +777,8 @@ void VideoOutDriver::Flip(const Request& req) {
         --flip_status.flip_pending_num;
     }
 
+    FlipTrace::Note(FlipTrace::FlipDone, s64(port->flip_status.count));
+    FlipTrace::Note(FlipTrace::EventTriggered, s64(port->flip_events.size()));
     // Trigger flip events for the port.
     for (auto event : port->flip_events) {
         auto equeue = Kernel::GetEqueue(event);
@@ -816,6 +831,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    last_submit_ns.store(NowNs(), std::memory_order_relaxed);
+    FlipTrace::Note(FlipTrace::SubmitFlip, index);
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
@@ -827,7 +844,30 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+void VideoOutDriver::ReportFlipState() {
+    const s64 now = NowNs();
+    const auto ago = [now](s64 t) { return t ? double(now - t) / 1e6 : -1.0; };
+    size_t queued;
+    {
+        std::scoped_lock lk{mutex};
+        queued = requests.size();
+    }
+    std::unique_lock lock{main_port.port_mutex};
+    const auto& s = main_port.flip_status;
+    std::printf("VideoOut: flips %llu, pending %d (GPU %d), %zu queued for the presenter, flip "
+                "rate %d, vblanks %llu, %zu flip event queues; ms since last SubmitFlip %.1f, "
+                "GPU-thread flip %.1f, flip done %.1f\n",
+                (unsigned long long)s.count, s.flip_pending_num, s.gc_queue_num, queued,
+                main_port.flip_rate, (unsigned long long)main_port.vblank_status.count,
+                main_port.flip_events.size(), ago(last_submit_ns.load()),
+                ago(last_internal_ns.load()), ago(last_flip_ns.load()));
+    std::fflush(stdout);
+    lock.unlock();
+    FlipTrace::Dump();
+}
+
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    last_internal_ns.store(NowNs(), std::memory_order_relaxed);
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);

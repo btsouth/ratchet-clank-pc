@@ -8,6 +8,7 @@
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/videoout/flip_trace.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
@@ -186,6 +187,23 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         rasterizer->GetBufferCache().ReportArenaBinds();
         Breadcrumbs::ReportStuck("a GPU wait made no progress for 3 s");
     });
+
+    // bbport (diagnostics): where each timeline stands when a game's flip watchdog fires.
+    static Presenter* reported = nullptr;
+    reported = this;
+    Libraries::VideoOut::FlipTrace::report_ticks = [] {
+        const auto print = [](const char* name, Scheduler& scheduler) {
+            auto* semaphore = scheduler.GetWorkSemaphore();
+            semaphore->Refresh();
+            std::printf("  %s timeline: next tick %llu, submitted %llu, GPU done %llu\n", name,
+                        (unsigned long long)semaphore->CurrentTick(),
+                        (unsigned long long)scheduler.SubmittedTick(),
+                        (unsigned long long)semaphore->KnownGpuTick());
+        };
+        print("draw", reported->draw_scheduler);
+        print("present", reported->present_scheduler);
+        print("flip", reported->flip_scheduler);
+    };
 }
 
 Presenter::~Presenter() {
@@ -525,6 +543,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     SubmitInfo info{};
     draw_scheduler.Flush(info);
     BbTimeline::Note(BbTimeline::PipeTask, 5, frame->ready_tick);
+    Libraries::VideoOut::FlipTrace::Note(Libraries::VideoOut::FlipTrace::FrameReady,
+                                         s64(frame->ready_tick));
 
     // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
     // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
@@ -542,7 +562,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             recent_frame_ticks.pop_front();
             if (recent_frame_ticks.size() == frames_ahead) {
                 BbStats::WaitTimer timer{BbStats::present_wait_ns};
+                using namespace Libraries::VideoOut;
+                FlipTrace::Note(FlipTrace::AheadWaitBegin, s64(tick));
                 draw_scheduler.Wait(tick);
+                FlipTrace::Note(FlipTrace::AheadWaitEnd, s64(tick));
             }
         }
     }
@@ -667,7 +690,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (const u64 tick = swapchain.PendingAcquireWait()) {
         present_scheduler.Wait(tick);
     }
-    if (!swapchain.AcquireNextImage()) {
+    using Libraries::VideoOut::FlipTrace::Note;
+    namespace FlipTrace = Libraries::VideoOut::FlipTrace;
+    Note(FlipTrace::AcquireBegin, 0);
+    const bool acquired = swapchain.AcquireNextImage();
+    Note(FlipTrace::AcquireEnd, acquired);
+    if (!acquired) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -809,12 +837,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     swapchain.NoteAcquireWait(scheduler.CurrentTick()); // this submission's tick
+    Note(FlipTrace::PresentSubmit, s64(frame->ready_tick));
     scheduler.Flush(info);
 
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool kept = swapchain.Present();
+        Note(FlipTrace::PresentDone, kept);
+        if (!kept) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

@@ -88,6 +88,11 @@ static ABI int32_t system_status(unsigned char *status) {
     return 0;
 }
 static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
+/* SceSystemServiceDisplaySafeAreaInfo: the whole screen (ratio 1.0). */
+static ABI int32_t safe_area(float *info) {
+    if (!info) return (int32_t)0x80A10003;
+    memset(info,0,132); *info=1.0f; return 0;
+}
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
 static ABI int32_t launch_browser(void) { note("SystemService: web browser request ignored (offline)"); return 0; }
 
@@ -99,6 +104,16 @@ static ABI int32_t *net_errno_loc(void) { return &net_errno; }
 static ABI int32_t net_pool_create(const char *name,int size,int flags) { (void)name; (void)size; (void)flags; return new_id(); }
 static ABI int32_t net_pool_destroy(int id) { (void)id; return 0; }
 static ABI int32_t net_unreachable(void) { net_errno=51; return NET_ENETUNREACH; }
+/* No socket ever becomes ready: an epoll set accepts what it is given and a wait returns no
+ * events once its timeout passes (a game's select() loop must not spin); -1 waits a while. */
+static ABI int32_t net_epoll_control(int id,int op,int socket,void *event) { (void)id; (void)op; (void)socket; (void)event; return 0; }
+static ABI int32_t net_epoll_wait(int id,void *events,int count,int32_t timeout_us) {
+    (void)id; (void)events; (void)count;
+    struct timespec t={.tv_sec=0,.tv_nsec=100000000};
+    if (timeout_us>=0) { t.tv_sec=timeout_us/1000000; t.tv_nsec=(long)(timeout_us%1000000)*1000; }
+    nanosleep(&t,NULL);
+    return 0;
+}
 static ABI int32_t net_epoll_create(const char *name,int flags) { (void)name; (void)flags; return new_id(); }
 static ABI int32_t net_epoll_destroy(int id) { (void)id; return 0; }
 static ABI int32_t net_resolver_create(const char *name,int pool,int flags) { (void)name; (void)pool; (void)flags; return new_id(); }
@@ -115,11 +130,53 @@ static ABI const char *net_ntop(int af,const void *src,char *dst,uint32_t size) 
     if (af!=2) { net_errno=47; return NULL; }
     return inet_ntop(AF_INET,src,dst,size);
 }
-static ABI int32_t netctl_state(int32_t *state) { if (!state) return NET_CTL_INVALID_ADDR; *state=0; return 0; }
-static ABI int32_t netctl_info(int code,void *info) { (void)code; (void)info; return NET_CTL_NOT_CONNECTED; }
-static ABI int32_t netctl_register(void *cb,void *arg,int32_t *cid) { (void)cb; (void)arg; if (!cid) return NET_CTL_INVALID_ADDR; *cid=new_id(); return 0; }
-static ABI int32_t netctl_check(void) { return 0; }
-static ABI int32_t netctl_unregister(int cid) { (void)cid; return 0; }
+static int np_signed_in(void);
+/* Disconnected, or with BB_NP_SIGNED_IN=1 connected to a LAN (IP obtained) whose internet servers
+ * never answer: what a console sees of a game whose servers are gone. */
+static ABI int32_t netctl_state(int32_t *state) {
+    if (!state) return NET_CTL_INVALID_ADDR;
+    *state=np_signed_in() ? 3 : 0; return 0;
+}
+static ABI int32_t netctl_info(int code,void *info) {
+    if (!np_signed_in()) return NET_CTL_NOT_CONNECTED;
+    if (!info) return NET_CTL_INVALID_ADDR;
+    memset(info,0,256); /* SceNetCtlInfo: a union, at most 256 bytes */
+    switch (code) {
+    case 1: *(uint32_t *)info=0; break;                                   /* device: wired */
+    case 3: *(uint32_t *)info=1500; break;                                /* MTU */
+    case 4: *(uint32_t *)info=1; break;                                   /* link: connected */
+    case 11: *(uint32_t *)info=0; break;                                  /* IP config: DHCP */
+    case 14: strcpy(info,"192.168.0.2"); break;                           /* IP address */
+    case 15: strcpy(info,"255.255.255.0"); break;                         /* netmask */
+    case 16: case 17: case 18: strcpy(info,"192.168.0.1"); break;         /* router, DNS */
+    case 19: *(uint32_t *)info=0; break;                                  /* HTTP proxy: off */
+    default: break;
+    }
+    return 0;
+}
+/* NetCtl callbacks: the first check after a registration tells it the network is
+ * disconnected (event 1), as an offline console does; a game may wait for that answer. */
+typedef void (ABI *NetCtlCallback)(int32_t event,void *arg);
+static struct { NetCtlCallback cb; void *arg; int told; } netctl_callbacks[8];
+static ABI int32_t netctl_register(void *cb,void *arg,int32_t *cid) {
+    if (!cid || !cb) return NET_CTL_INVALID_ADDR;
+    for (int i=0;i<8;++i) if (!netctl_callbacks[i].cb) {
+        netctl_callbacks[i].cb=(NetCtlCallback)cb; netctl_callbacks[i].arg=arg; netctl_callbacks[i].told=0;
+        *cid=i+1; return 0;
+    }
+    return (int32_t)0x80412104; /* NET_CTL CALLBACK_MAX */
+}
+static ABI int32_t netctl_check(void) {
+    for (int i=0;i<8;++i) if (netctl_callbacks[i].cb && !netctl_callbacks[i].told) {
+        netctl_callbacks[i].told=1;
+        netctl_callbacks[i].cb(np_signed_in() ? 3 : 1,netctl_callbacks[i].arg); /* IP obtained : disconnected */
+    }
+    return 0;
+}
+static ABI int32_t netctl_unregister(int cid) {
+    if (cid>=1 && cid<=8) netctl_callbacks[cid-1].cb=NULL;
+    return 0;
+}
 static ABI int32_t netctl_nat(uint32_t *info) {
     if (!info) return NET_CTL_INVALID_ADDR;
     info[1]=0; info[2]=3; info[3]=0; /* stun failed, NAT type 3, no mapped address */
@@ -128,6 +185,10 @@ static ABI int32_t netctl_nat(uint32_t *info) {
 static ABI int32_t lib_init_id(void) { return new_id(); }
 static ABI int32_t ok_void(void) { return 0; }
 static ABI int32_t http_fail(void) { return HTTP_NETWORK; }
+/* A connection or request setting read back: off. */
+static ABI int32_t http_flag_off(int32_t id,int32_t *value) { (void)id; if (value) *value=0; return 0; }
+/* The errno of the last failed transfer: the network is unreachable (ENETUNREACH). */
+static ABI int32_t http_last_errno(int32_t id,int32_t *value) { (void)id; if (value) *value=51; return 0; }
 /* Objects are created so setup code proceeds; any transfer fails as unplugged. */
 static ABI int32_t http_object(void) { return new_id(); }
 static ABI int32_t http_epoll(int32_t ctx,void **handle) {
@@ -142,20 +203,96 @@ static ABI int32_t http_wait(void *handle,void *events,int32_t max,int64_t timeo
 }
 
 /* ---- NP (PSN): signed out ---- */
+/* BB_NP_SIGNED_IN=1: user 1 is signed in to PSN (online ID: the user name) while every server
+ * request still fails, as on a console whose game servers are gone. Some games (LittleBigPlanet 3)
+ * only reach their offline fallback that way. Default: signed out. */
+static int np_signed_in(void) {
+    static int value=-1;
+    if (value<0) { const char *e=getenv("BB_NP_SIGNED_IN"); value=e && !strcmp(e,"1"); }
+    return value;
+}
+static void np_online_id(char *id) { /* SceNpOnlineId: 16 characters, terminator, 3 spare */
+    memset(id,0,20);
+    char name[32]="";
+    user_name(USER_ID,name,sizeof(name));
+    size_t n=strlen(name);
+    memcpy(id,name,n<16 ? n : 16);
+}
 static ABI int32_t np_state(int32_t user,int32_t *state) {
     if (!state) return NP_INVALID_ARGUMENT;
-    (void)user; *state=1; /* SIGNED_OUT */
+    (void)user; *state=np_signed_in() ? 2 : 1; /* SIGNED_IN : SIGNED_OUT */
     return 0;
 }
+static ABI int32_t np_get_online_id(int32_t user,char *id) {
+    if (!id) return NP_INVALID_ARGUMENT;
+    if (!np_signed_in()) return NP_SIGNED_OUT;
+    (void)user; np_online_id(id); return 0;
+}
+static ABI int32_t np_get_np_id(int32_t user,char *id) { /* SceNpId: online ID, opt 8, reserved 8 */
+    if (!id) return NP_INVALID_ARGUMENT;
+    if (!np_signed_in()) return NP_SIGNED_OUT;
+    (void)user; memset(id,0,36); np_online_id(id); return 0;
+}
+/* PSN itself answers (signed in: available); only the game's own servers are gone. */
+static ABI int32_t np_availability(void) { return np_signed_in() ? 0 : NP_SIGNED_OUT; }
+/* sceNpAuth: signed in, PSN issues an authorization code (a placeholder: no server ever checks
+ * it, the game's own servers are unreachable). */
+static ABI int32_t np_auth_request(void) { return np_signed_in() ? new_id() : NP_SIGNED_OUT; }
+static ABI int32_t np_auth_code(int32_t request,const void *param,char *code,int32_t *issuer) {
+    (void)request; (void)param;
+    if (!np_signed_in()) return NP_SIGNED_OUT;
+    if (!code) return NP_INVALID_ARGUMENT;
+    memset(code,0,136); strcpy(code,"bbportofflinecode"); /* SceNpAuthorizationCode: 128+1 chars, 7 padding */
+    if (issuer) *issuer=1;
+    return 0;
+}
+static ABI int32_t np_account_country(int32_t user,char *country) { /* SceNpCountryCode: 2 + NUL */
+    if (!country) return NP_INVALID_ARGUMENT;
+    if (!np_signed_in()) return NP_SIGNED_OUT;
+    (void)user; memset(country,0,4); memcpy(country,"us",2); return 0;
+}
 static ABI int32_t np_signed_out(void) { return NP_SIGNED_OUT; }
+/* sceNpRegisterStateCallback: the next sceNpCheckCallback reports user 1 signed out (state 1),
+ * as the system does after a registration; a game may wait for it before going offline. */
+typedef void (ABI *NpStateCallback)(int32_t user,int32_t state,const void *np_id,void *arg);
+static NpStateCallback np_state_cb;
+static void *np_state_arg;
+static int np_state_told;
+static ABI int32_t np_state_register(void *cb,void *arg) {
+    if (!cb) return NP_INVALID_ARGUMENT;
+    if (np_state_cb) return (int32_t)0x80550004; /* NP CALLBACK_ALREADY_REGISTERED */
+    np_state_cb=(NpStateCallback)cb; np_state_arg=arg; np_state_told=0;
+    return 0;
+}
+static ABI int32_t np_state_unregister(void) { np_state_cb=NULL; return 0; }
+static ABI int32_t np_check_callback(void) {
+    if (np_state_cb && !np_state_told) {
+        static const unsigned char no_id[36];
+        np_state_told=1;
+        static char id[36];
+        printf("Runtime: NP state callback: user 1 %s\n",np_signed_in() ? "signed in" : "signed out");
+        if (np_signed_in()) { np_get_np_id(USER_ID,id); np_state_cb(USER_ID,2,id,np_state_arg); }
+        else np_state_cb(USER_ID,1,no_id,np_state_arg);
+    }
+    return 0;
+}
 static ABI int32_t np_register(void *cb,void *arg) { (void)cb; (void)arg; return new_id(); }
 static ABI void np_register_void(void *cb,void *arg) { (void)cb; (void)arg; }
 static ABI int32_t np_request(const void *param) { (void)param; return new_id(); }
 static ABI int32_t np_request_ctx(int32_t ctx,const void *param) { (void)ctx; (void)param; return new_id(); }
-static ABI int32_t np_poll(int32_t request,int32_t *result) { (void)request; if (result) *result=NP_SIGNED_OUT; return 0; }
-static ABI int32_t np_compare(const void *a,const void *b) {
+static int np_signed_in(void);
+/* An NP request is finished at once: signed out it failed; signed in (BB_NP_SIGNED_IN=1) PSN
+ * answered the availability check (the requests that need a server fail when they are made). */
+static ABI int32_t np_poll(int32_t request,int32_t *result) { (void)request; if (result) *result=np_signed_in() ? 0 : NP_SIGNED_OUT; return 0; }
+/* Online IDs compare as strings of up to 16 characters (what follows the terminator does not
+ * count); NP IDs also compare their opt and reserved bytes (SceNpId: handle 20, opt 8, reserved 8). */
+static ABI int32_t np_compare_online(const char *a,const char *b) {
     if (!a || !b) return NP_INVALID_ARGUMENT;
-    return memcmp(a,b,16) ? (int32_t)0x80550609 : 0; /* NP_UTIL NOT_MATCH */
+    return strncmp(a,b,16) ? (int32_t)0x80550609 : 0; /* NP_UTIL NOT_MATCH */
+}
+static ABI int32_t np_compare(const char *a,const char *b) {
+    if (!a || !b) return NP_INVALID_ARGUMENT;
+    return strncmp(a,b,16) || memcmp(a+20,b+20,16) ? (int32_t)0x80550609 : 0;
 }
 
 /* ---- Voice chat: ports exist, carry no audio ---- */
@@ -267,7 +404,14 @@ static ABI int32_t ime_result(uint32_t *result) {
 }
 static ABI int32_t ime_term(void) { memset(&ime,0,sizeof(ime)); return 0; }
 
+/* ---- Content search (the console's media library): no content, never updated ---- */
+static ABI int32_t content_search_init(const void *param) { (void)param; return 0; }
+static ABI int32_t content_search_term(void) { return 0; }
+static ABI int32_t content_search_last_update(int64_t *id) { if (id) *id=0; return 0; }
+static ABI int32_t content_search_app_index(uint32_t *index) { if (index) *index=0; return 0; }
+
 /* ---- Trophies: accepted locally, recorded in the log ---- */
+static uint32_t trophy_flags[4];
 static ABI int32_t trophy_context(int32_t *ctx,int32_t user,uint32_t label,uint64_t options) {
     (void)user; (void)label; (void)options;
     if (!ctx) return TROPHY_INVALID;
@@ -277,9 +421,20 @@ static ABI int32_t trophy_handle(int32_t *handle) { if (!handle) return TROPHY_I
 static ABI int32_t trophy_register(int32_t ctx,int32_t handle,uint64_t options) { (void)ctx; (void)handle; (void)options; return 0; }
 static ABI int32_t trophy_unlock(int32_t ctx,int32_t handle,int32_t id,int32_t *platinum) {
     (void)ctx; (void)handle;
+    if (id<0 || id>=128) return TROPHY_INVALID;
+    pthread_mutex_lock(&lock); trophy_flags[id/32]|=UINT32_C(1)<<(id%32); pthread_mutex_unlock(&lock);
     printf("Runtime: trophy %d unlocked\n",id);
     if (platinum) *platinum=-1;
     return 0;
+}
+static ABI int32_t trophy_unlock_state(int32_t ctx,int32_t handle,uint32_t *flags,uint32_t *count) {
+    (void)ctx; (void)handle;
+    if (!flags || !count) return TROPHY_INVALID;
+    pthread_mutex_lock(&lock);
+    memcpy(flags,trophy_flags,sizeof(trophy_flags));
+    *count=0;
+    for (int i=0;i<4;++i) *count+=(uint32_t)__builtin_popcount(trophy_flags[i]);
+    pthread_mutex_unlock(&lock); return 0;
 }
 static ABI int32_t trophy_game_info(int32_t ctx,int32_t handle,void *details,void *data) {
     (void)ctx; (void)handle;
@@ -329,6 +484,30 @@ static ABI int32_t playgo_locus(int32_t handle,const uint16_t *ids,uint32_t coun
     }
     return 0;
 }
+/* Nothing left to install: an empty to-do list, every chunk complete, full speed. */
+static ABI int32_t playgo_todo(int32_t handle,void *list,uint32_t count,uint32_t *out) {
+    (void)list; (void)count;
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    if (!out) return PLAYGO_BAD_POINTER;
+    *out=0; return 0;
+}
+static ABI int32_t playgo_progress(int32_t handle,const uint16_t *ids,uint32_t count,uint64_t *progress) {
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    if (!ids || !progress) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    progress[0]=progress[1]=(uint64_t)count*1024*1024; /* progressSize, totalSize */
+    return 0;
+}
+static ABI int32_t playgo_get_speed(int32_t handle,int32_t *speed) {
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    if (!speed) return PLAYGO_BAD_POINTER;
+    *speed=2; /* SCE_PLAYGO_INSTALL_SPEED_TRICKLE..FULL: full */
+    return 0;
+}
+static ABI int32_t playgo_close(int32_t handle) {
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    playgo_handle=0; return 0;
+}
 static ABI int32_t playgo_speed(int32_t handle,int32_t speed) { (void)speed; return handle==playgo_handle && handle ? 0 : PLAYGO_BAD_HANDLE; }
 
 /* ---- DiscMap: the game is fully installed, no disc bitmap exists ---- */
@@ -351,11 +530,6 @@ static ABI int32_t mouse_read(int32_t handle,unsigned char *data,int32_t count) 
 static ABI int32_t mouse_close(int32_t handle) { (void)handle; return 0; }
 static ABI int32_t audio_in_open(void) { return AUDIO_IN_NOT_OPENED; }
 
-/* ---- Live streaming: no broadcast service on the PC. Enabling or disabling
- * streaming succeeds as on a PS4 that is not streaming; nothing is sent. ---- */
-static ABI int32_t live_streaming_enable(int32_t enable) { (void)enable; return 0; }
-
-
 static const RuntimeExport exports[]={
     {"sceUserServiceInitialize",user_initialize}, {"sceUserServiceTerminate",user_terminate},
     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
@@ -375,7 +549,7 @@ static const RuntimeExport exports[]={
     {"sceNetSetsockopt",net_unreachable}, {"sceNetGetsockopt",net_unreachable},
     {"sceNetGetsockname",net_unreachable}, {"sceNetShutdown",net_unreachable},
     {"sceNetSocketClose",net_unreachable}, {"sceNetSocketAbort",net_unreachable},
-    {"sceNetEpollControl",net_unreachable}, {"sceNetEpollWait",net_unreachable}, {"sceNetEpollAbort",net_unreachable},
+    {"sceNetEpollControl",net_epoll_control}, {"sceNetEpollWait",net_epoll_wait}, {"sceNetEpollAbort",net_unreachable},
     {"sceNetResolverStartNtoa",net_unreachable}, {"sceNetResolverStartAton",net_unreachable},
     {"sceNetCtlGetState",netctl_state}, {"sceNetCtlGetInfo",netctl_info},
     {"sceNetCtlRegisterCallback",netctl_register}, {"sceNetCtlCheckCallback",netctl_check},
@@ -393,18 +567,33 @@ static const RuntimeExport exports[]={
     {"sceHttpSetEpoll",ok_void}, {"sceHttpUnsetEpoll",ok_void}, {"sceHttpWaitRequest",http_wait},
     {"sceHttpGetStatusCode",http_fail}, {"sceHttpGetResponseContentLength",http_fail},
     {"sceHttpReadData",http_fail},
-    {"sceNpGetState",np_state}, {"sceNpGetOnlineId",np_signed_out}, {"sceNpGetNpId",np_signed_out},
-    {"sceNpRegisterStateCallback",np_register}, {"sceNpUnregisterStateCallback",ok_void},
+    {"sceHttpCreateConnection",http_object}, {"sceHttpCreateRequest",http_object},
+    {"sceHttpCreateRequest2",http_object}, {"sceHttpCreateRequestWithURL2",http_object},
+    {"sceHttpAbortRequest",ok_void}, {"sceHttpAbortRequestForce",ok_void},
+    {"sceHttpSetAutoRedirect",ok_void}, {"sceHttpGetAutoRedirect",http_flag_off},
+    {"sceHttpSetCookieEnabled",ok_void}, {"sceHttpGetCookieEnabled",http_flag_off},
+    {"sceHttpSetAuthEnabled",ok_void}, {"sceHttpGetAuthEnabled",http_flag_off},
+    {"sceHttpSetSendTimeOut",ok_void}, {"sceHttpSetRecvTimeOut",ok_void},
+    {"sceHttpSetResolveTimeOut",ok_void}, {"sceHttpSetResolveRetry",ok_void},
+    {"sceHttpsSetSslCallback",ok_void}, {"sceHttpsLoadCert",ok_void}, {"sceHttpsUnloadCert",ok_void},
+    {"sceHttpSetRedirectCallback",ok_void}, {"sceHttpSetCookieSendCallback",ok_void},
+    {"sceHttpSetCookieRecvCallback",ok_void}, {"sceHttpSetAuthInfoCallback",ok_void},
+    {"sceHttpAddCookie",ok_void}, {"sceHttpCookieFlush",ok_void},
+    {"sceHttpRemoveRequestHeader",ok_void}, {"sceHttpGetLastErrno",http_last_errno},
+    {"sceHttpGetAllResponseHeaders",http_fail}, {"sceHttpParseResponseHeader",http_fail},
+    {"sceHttpParseStatusLine",http_fail},
+    {"sceNpGetState",np_state}, {"sceNpGetOnlineId",np_get_online_id}, {"sceNpGetNpId",np_get_np_id}, {"sceNpGetAccountCountry",np_account_country},
+    {"sceNpRegisterStateCallback",np_state_register}, {"sceNpUnregisterStateCallback",np_state_unregister},
     {"sceNpRegisterGamePresenceCallback",np_register_void}, {"sceNpRegisterPlusEventCallback",np_register},
-    {"sceNpUnregisterPlusEventCallback",ok_void}, {"sceNpCheckCallback",ok_void},
+    {"sceNpUnregisterPlusEventCallback",ok_void}, {"sceNpCheckCallback",np_check_callback},
     {"sceNpSetNpTitleId",ok_void}, {"sceNpNotifyPlusFeature",ok_void}, {"sceNpSetContentRestriction",ok_void},
     {"sceNpCreateAsyncRequest",np_request}, {"sceNpDeleteRequest",ok_void}, {"sceNpAbortRequest",ok_void},
-    {"sceNpPollAsync",np_poll}, {"sceNpCheckNpAvailability",np_signed_out},
+    {"sceNpPollAsync",np_poll}, {"sceNpCheckNpAvailability",np_availability},
     {"sceNpGetParentalControlInfo",np_signed_out}, {"sceNpCheckPlus",np_signed_out},
     {"sceNpGetGamePresenceStatus",np_signed_out},
-    {"sceNpCmpNpId",np_compare}, {"sceNpCmpOnlineId",np_compare},
-    {"sceNpAuthCreateAsyncRequest",np_request}, {"sceNpAuthDeleteRequest",ok_void},
-    {"sceNpAuthPollAsync",np_poll}, {"sceNpAuthGetAuthorizationCode",np_signed_out},
+    {"sceNpCmpNpId",np_compare}, {"sceNpCmpOnlineId",np_compare_online},
+    {"sceNpAuthCreateAsyncRequest",np_auth_request}, {"sceNpAuthDeleteRequest",ok_void},
+    {"sceNpAuthPollAsync",np_poll}, {"sceNpAuthGetAuthorizationCode",np_auth_code}, {"sceNpAuthCreateRequest",np_auth_request},
     {"sceNpLookupCreateTitleCtx",np_request}, {"sceNpLookupDeleteTitleCtx",ok_void},
     {"sceNpLookupCreateAsyncRequest",np_request_ctx}, {"sceNpLookupDeleteRequest",ok_void},
     {"sceNpLookupAbortRequest",ok_void}, {"sceNpLookupPollAsync",np_poll}, {"sceNpLookupNpId",np_signed_out},
@@ -463,19 +652,26 @@ static const RuntimeExport exports[]={
     {"sceImeDialogTerm",ime_term}, {"sceImeDialogAbort",ime_term},
     {"sceNpTrophyCreateContext",trophy_context}, {"sceNpTrophyCreateHandle",trophy_handle},
     {"sceNpTrophyRegisterContext",trophy_register}, {"sceNpTrophyUnlockTrophy",trophy_unlock},
+    {"sceNpTrophyGetTrophyUnlockState",trophy_unlock_state},
+    {"sceContentSearchInit",content_search_init}, {"sceContentSearchTerm",content_search_term},
+    {"sceContentSearchGetContentLastUpdateId",content_search_last_update},
+    {"sceContentSearchGetMyApplicationIndex",content_search_app_index},
     {"sceNpTrophyGetGameInfo",trophy_game_info}, {"sceNpTrophyGetTrophyInfo",trophy_info},
     {"scePlayGoInitialize",playgo_init}, {"scePlayGoOpen",playgo_open}, {"scePlayGoGetChunkId",playgo_chunk_ids},
     {"scePlayGoGetLocus",playgo_locus}, {"scePlayGoSetInstallSpeed",playgo_speed},
+    {"scePlayGoGetToDoList",playgo_todo}, {"scePlayGoGetProgress",playgo_progress},
+    {"scePlayGoGetInstallSpeed",playgo_get_speed}, {"scePlayGoClose",playgo_close},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area},
     {"sceMouseInit",ok_void}, {"sceMouseOpen",mouse_open}, {"sceMouseRead",mouse_read}, {"sceMouseClose",mouse_close},
     {"sceAudioInOpen",audio_in_open},
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
-    {"sceGameLiveStreamingInitialize",ok_void}, {"sceGameLiveStreamingTerminate",ok_void},
-    {"sceGameLiveStreamingEnableLiveStreaming",live_streaming_enable},
 };
 uintptr_t runtime_services_resolve(const char *name) {
     const uintptr_t online=runtime_net_resolve(name); /* BB_ONLINE=1: the online module first */
-    return online ? online : RUNTIME_LOOKUP(exports,name);
+    if (online) return online;
+    uintptr_t udp=runtime_udp_resolve(name);
+    return udp ? udp : RUNTIME_LOOKUP(exports,name);
 }
 #else
 uintptr_t runtime_services_resolve(const char *name) { (void)name; return 0; }

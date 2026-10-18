@@ -20,8 +20,8 @@ static uint64_t capabilities;
 static _Atomic size_t guards_acquired, guards_released;
 static uint64_t stack_canary;
 static _Atomic size_t memory_calls;
-/* Dynamic TLS of linked modules: module IDs 2..7 (1 is the eboot's static TLS). */
-#define TLS_MODULES 8
+/* Dynamic TLS of linked modules: module IDs 2..15 (1 is the eboot's static TLS). */
+#define TLS_MODULES 16
 static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
 static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
 static void *process_param;
@@ -262,6 +262,10 @@ static uintptr_t resolve_scoped(const char *name, int is_data) {
     if (content) return content;
     uintptr_t timer = runtime_time_resolve(name);
     if (timer) return timer;
+    uintptr_t misc = runtime_misc_resolve(name);
+    if (misc) return misc;
+    uintptr_t fiber = runtime_fiber_resolve(name);
+    if (fiber) return fiber;
     uintptr_t sema = runtime_sema_resolve(name);
     if (sema) return sema;
     uintptr_t evf = runtime_evf_resolve(name);

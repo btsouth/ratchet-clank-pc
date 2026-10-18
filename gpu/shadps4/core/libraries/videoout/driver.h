@@ -10,6 +10,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -95,6 +96,10 @@ public:
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
+    /// bbport (diagnostics): the flip state, printed when the game's GPU watchdog fires
+    /// (sceGnmDebugHardwareStatus): pending flips and how long ago each stage last ran.
+    void ReportFlipState();
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -132,6 +137,8 @@ private:
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    /// bbport: steady-clock ns of the last SubmitFlip, SubmitFlipInternal (GPU thread) and Flip.
+    std::atomic<s64> last_submit_ns{0}, last_internal_ns{0}, last_flip_ns{0};
 };
 
 } // namespace Libraries::VideoOut

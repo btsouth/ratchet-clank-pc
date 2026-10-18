@@ -71,7 +71,7 @@ def module(path):
             target, info, addend = unpack('<QQq', table, pos)
             relocations.append((target, info & 0xffffffff, info >> 32, addend))
     return dict(elf=elf, header=header, ph=ph, tags=tags, symbols=symbols, relocs=relocations,
-                identity=identity, libraries=libraries, modules=modules,
+                needed=[string(v) for t, v in dynamic if t == 1], identity=identity, libraries=libraries, modules=modules,
                 sha256=hashlib.sha256(source).hexdigest(), missing=missing)
 
 
@@ -90,8 +90,22 @@ def patch_fs_loads(image, ph, base):
     return patched
 
 
+def app_modules(game, needed):
+    """The game's own modules the eboot needs (outside sce_module, e.g. LittleBigPlanet 3's
+    gamedata_orbis/spu/spu.prx): paths relative to the game folder. The game loads them with
+    sceKernelLoadStartModule; here they are linked like the bundled system modules."""
+    wanted = {name.lower() for name in needed}
+    found = {}
+    for path in sorted(game.rglob('*.prx')):
+        relative = path.relative_to(game)
+        if relative.parts[0] not in ('sce_module', 'sce_sys') and path.name.lower() in wanted:
+            found.setdefault(path.name.lower(), relative.as_posix())
+    return [found[name] for name in sorted(found)]
+
+
 def link(game, out, module_names=DEFAULT_MODULES):
     main = module(game / 'eboot.bin')
+    module_names = list(module_names) + app_modules(game, main['needed'])
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
     if magic != b'BBPROBE2':
@@ -129,7 +143,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     for filename in module_names:
-        m = module(game / 'sce_module' / filename)
+        m = module(game / filename if '/' in filename else game / 'sce_module' / filename)
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
         modsize = max(p['vaddr'] + p['memsz'] for p in loads)
         if base + modsize > 512 * 1024 * 1024:

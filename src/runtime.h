@@ -14,6 +14,7 @@ void runtime_restart(void);
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);
+void runtime_thread_alt_stack(void);
 void runtime_guest_frames(uintptr_t rbp, uintptr_t rsp);
 void runtime_report(void);
 void runtime_finalize(void *dso);
@@ -49,6 +50,8 @@ uintptr_t runtime_sema_resolve(const char *name);
 uintptr_t runtime_evf_resolve(const char *name);
 uintptr_t runtime_psem_resolve(const char *name);
 void runtime_psem_report(void);
+uintptr_t runtime_fiber_resolve(const char *name);
+uintptr_t runtime_misc_resolve(const char *name);
 void runtime_sse4a_init(uintptr_t image);
 int runtime_sse4a_fault(void *context);
 void runtime_sse4a_report(void);
@@ -104,4 +107,10 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+
+/* Optional local datagram transport. */
+uintptr_t runtime_udp_resolve(const char *name);
+int runtime_file_adopt(int host);
+int runtime_file_host_fd(int fd);
+
 #endif

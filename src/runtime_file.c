@@ -361,6 +361,19 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     if (save_trace() && save_path(guest)) printf("Save trace: open(%s) -> fd %d\n",guest,fd);
     return fd;
 }
+int runtime_file_adopt(int host) {
+    pthread_mutex_lock(&lock);
+    int fd;
+    for (fd=3;fd<MAX_FILES && files[fd].used;++fd) {}
+    if (fd<MAX_FILES) files[fd]=(File){.used=1,.host=host};
+    pthread_mutex_unlock(&lock);
+    return fd<MAX_FILES ? fd : -1;
+}
+int runtime_file_host_fd(int fd) {
+    pthread_mutex_lock(&lock);
+    File *f=get(fd); int host=f ? f->host : -1;
+    pthread_mutex_unlock(&lock); return host;
+}
 static int64_t do_close(int fd) {
     if (fd>=0 && fd<3) return 0;
     pthread_mutex_lock(&lock);

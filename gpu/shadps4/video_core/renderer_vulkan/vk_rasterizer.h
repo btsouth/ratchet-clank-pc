@@ -426,6 +426,23 @@ private:
     /// (vertex_binds, index_bind) and recording the binds.
     void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
     void EmitVertexBuffers();
+
+    /// bbport BB_CAPTURE_IMAGES (frame capture): a pass's targets and the images a draw or
+    /// dispatch wrote as storage are written out when the pass ends (before the next pass or
+    /// dispatch transitions anything).
+    struct CaptureDump {
+        VideoCore::ImageId id;
+        u64 uid;
+        u32 entry;
+        u32 slot; ///< color 0..7, 8 depth, 16+ storage binding
+        u32 layer;
+    };
+    std::vector<CaptureDump> capture_dumps;
+    u64 capture_dump_key = 0;
+    u64 capture_dump_bytes = 0;
+    std::vector<VAddr> capture_sampled; ///< textures dumped in this capture
+    u64 CapturePassKey() const;
+    void FlushCaptureDumps(bool pass_continues);
     void ResolveIndexBuffer(u32 index_offset);
     void EmitIndexBuffer();
 
@@ -434,6 +451,11 @@ private:
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline, bool dry_run = false);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    /// bbport: a masked fill compute shader with a full mask, as a fill and image clears.
+    bool IsComputeMaskedFill(const Pipeline* pipeline);
+    /// bbport: a dword of a stage's buffer as the shader reads it (the constant ring's copy, or
+    /// the game's memory when the CPU has it); nullopt if neither.
+    std::optional<u32> ReadStageDword(const Shader::Info& info, u32 index, u32 offset);
 
 private:
     friend class VideoCore::BufferCache;

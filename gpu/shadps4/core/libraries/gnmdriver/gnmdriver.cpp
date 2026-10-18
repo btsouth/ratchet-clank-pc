@@ -17,6 +17,8 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/videoout/flip_trace.h"
+#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "core/platform.h"
@@ -395,6 +397,10 @@ int PS4_SYSV_ABI sceGnmDebuggerWriteSqIndirectRegister() {
 
 int PS4_SYSV_ABI sceGnmDebugHardwareStatus() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+    // bbport: games call it when their GPU watchdog gives up (LBP3 before its int 0x41).
+    VideoOut::ReportFlipState();
+    Vulkan::Breadcrumbs::ReportStuck("guest GPU watchdog");
+    AmdGpu::ReportQueueWait();
     return ORBIS_OK;
 }
 
@@ -2416,6 +2422,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    VideoOut::FlipTrace::Note(VideoOut::FlipTrace::SubmitAndFlip, buf_idx);
 
     if (count != 0) {
         if (!dcb_gpu_addrs) {

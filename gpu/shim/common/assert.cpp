@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include <unistd.h>
+#include <execinfo.h>
 
 // bb-probe (probe.c): set while the port restarts itself through run.sh. The device fd is closed
 // before exec; Vulkan calls failing then are not errors: this thread waits for the exec instead.
@@ -18,6 +19,9 @@ void assert_fail_impl() {
     }
     std::fflush(stdout);
     std::fputs("STOP: GPU library assertion failed (see GPU log above)\n", stderr);
+    // Where it failed (addr2line -e libbbgpu.so takes the +offsets).
+    void* frames[32];
+    backtrace_symbols_fd(frames, backtrace(frames, 32), 2);
     std::_Exit(23);
 }
 

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,26 @@ public:
     /// Contents of a bound buffer (first 1 KiB), kept for small passes and a pass's first draw.
     static void Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size);
     static void Note(const char* text);
+
+    /// bbport BB_CAPTURE_IMAGES=1: the recorded frame's pass targets (and storage images) are
+    /// also written as raw files, pNNN_... with NNN the pass number in the frame file.
+    static bool DumpingImages() {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_CAPTURE_IMAGES");
+            return env && (env[0] == '1' || env[0] == '2');
+        }();
+        return on && state.load(std::memory_order_relaxed) == Recording;
+    }
+    /// BB_CAPTURE_IMAGES=2: sampled textures too (once per frame each).
+    static bool DumpingSampled() {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_CAPTURE_IMAGES");
+            return env && env[0] == '2';
+        }();
+        return on;
+    }
+    /// Number of the last pass or dispatch in the frame file (GPU thread).
+    static u32 LastEntry();
 
 private:
     enum : u32 { Idle, Armed, Recording };

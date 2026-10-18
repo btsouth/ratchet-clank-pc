@@ -8,6 +8,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/flip_trace.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
@@ -348,6 +349,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    FlipTrace::Note(FlipTrace::EopRegistered, buf_id);
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
@@ -462,6 +464,12 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitChangeBufferAttribute(s32 handle, s32 attribut
 s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom) {
     LOG_ERROR(Lib_VideoOut, "(STUBBED) called top = {}, bottom = {}", top, bottom);
     return ORBIS_OK;
+}
+
+void ReportFlipState() {
+    if (driver) {
+        driver->ReportFlipState();
+    }
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {

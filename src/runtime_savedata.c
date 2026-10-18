@@ -153,7 +153,7 @@ static ABI int32_t save_terminate(void) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     initialized=0; return 0;
 }
-static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
+static int32_t mount_impl(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (user<0) return ERR_INVALID_USER;
     if (!dir || !result || !valid_name(dir->data,sizeof(dir->data))) return ERR_PARAMETER;
@@ -188,6 +188,14 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
            exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
     return 0;
+}
+/* Log failures as well as successful mounts: first-boot callers often probe
+ * a missing directory before choosing their create or dialog path. */
+static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
+    int32_t rc=mount_impl(user,title,dir,mode,result);
+    printf("Runtime: save mount user=%d title=%.10s dir=%.32s mode=0x%x result=0x%08x\n",
+           user,title ? title : title_id,dir ? dir->data : "(null)",mode,(uint32_t)rc);
+    return rc;
 }
 static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
     if (!m) return ERR_PARAMETER;

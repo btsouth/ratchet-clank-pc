@@ -587,6 +587,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         std::printf("Guest memory: the layer's memory module binds the game's memory in place "
                     "(chunk buffers, no sparse arena for it; BB_LAYER_MEMORY=1)\n");
     }
+    while (ARENA_PAGE_BITS > MIN_ARENA_PAGE_BITS &&
+           (u64{2} << ARENA_PAGE_BITS) > instance.SparseAddressSpaceSize()) {
+        --ARENA_PAGE_BITS;
+    }
+    if (ARENA_PAGE_BITS != MAX_ARENA_PAGE_BITS) {
+        ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
+        NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
+        std::printf("GPU: sparse address space %llu MiB: arenas of %llu MiB\n",
+                    (unsigned long long)(instance.SparseAddressSpaceSize() >> 20),
+                    (unsigned long long)(ARENA_PAGE_SIZE >> 20));
+    }
     const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
                                          instance.GetReadbackQueueFamilyIndex()};
     const bool shared = bool(instance.GetReadbackQueue()); // as Buffer creates the arenas
@@ -1065,6 +1076,59 @@ void PrintBufferStats() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    const auto bound = ObtainBufferUnsynced(device_addr, size, is_written, is_texel_buffer);
+    // Read-only texel buffers were synchronized on the way (SynchronizeMemoryFromImage).
+    if (bound.first && (is_written || !is_texel_buffer)) {
+        SynchronizeRenderedImage(bound.first, bound.second, device_addr, size);
+    }
+    return bound;
+}
+
+void BufferCache::SynchronizeRenderedImage(const Buffer* buffer, u64 offset, VAddr device_addr,
+                                           u32 size) {
+    // A storage buffer over render targets: LBP3 clears the alpha of its scene color with a
+    // compute shader that reads each dword and writes it back masked
+    // (dst = dst & ~mask | value & mask), and clears its light atlases (two 16 MB targets) with one
+    // 64 MB binding of the same shader. Without the rendered images in memory first, the stale
+    // memory replaced them. Every whole image inside the binding rendered (or stored) by the GPU
+    // since memory last had it, oldest GPU write first; a written binding marks them stale
+    // (InvalidateMemoryFromGPU).
+    const u64 generation = texture_cache.RegistryGeneration();
+    auto& miss = rendered_miss_cache[((device_addr >> 6) ^ size * 0x9E3779B1u) %
+                                     rendered_miss_cache.size()];
+    if (miss.address == device_addr && miss.size == size && miss.generation == generation) {
+        return;
+    }
+    const VAddr end = device_addr + size;
+    boost::container::small_vector<ImageId, 8> rendered;
+    bool any_inside = false;
+    texture_cache.ForEachImageInRegion(device_addr, size, [&](ImageId image_id, Image& image) {
+        if (image.info.guest_address < device_addr ||
+            image.info.guest_address + image.info.guest_size > end) {
+            return;
+        }
+        any_inside = true;
+        if ((image.flags & ImageFlagBits::GpuModified) && !(image.flags & ImageFlagBits::Dirty) &&
+            !image.info.props.is_depth && !texture_cache.IsMeta(image.info.guest_address)) {
+            rendered.push_back(image_id);
+        }
+    });
+    if (!any_inside) {
+        miss = {device_addr, size, generation};
+        return;
+    }
+    std::stable_sort(rendered.begin(), rendered.end(), [&](ImageId a, ImageId b) {
+        return texture_cache.GetImage(a).gpu_write_tick < texture_cache.GetImage(b).gpu_write_tick;
+    });
+    for (const ImageId image_id : rendered) {
+        Image& image = texture_cache.GetImage(image_id);
+        WriteImageToMemory(image, buffer, offset + (image.info.guest_address - device_addr));
+    }
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferUnsynced(VAddr device_addr, u32 size,
+                                                                bool is_written,
+                                                                bool is_texel_buffer) {
     BB_SECTION(ObtainBuffer);
     const bool stats = BufferStatsEnabled();
     if (stats) {
@@ -3287,13 +3351,19 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
         miss = {device_addr, size, generation};
         return false;
     }
-    // bbport: the lookups above only read what the texture binding helper leaves alone; the
-    // copy below changes image state, so the helper finishes first.
-    runtime.BeforeImageAccess();
     Image& image = texture_cache.GetImage(image_id);
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
+    return WriteImageToMemory(image, arena, arena_offset);
+}
+
+bool BufferCache::WriteImageToMemory(Image& image, const Buffer* arena, u64 arena_offset) {
+    // bbport: the lookups before only read what the texture binding helper leaves alone; the
+    // copy below changes image state, so the helper finishes first.
+    runtime.BeforeImageAccess();
+    const VAddr device_addr = image.info.guest_address;
+    const u64 size = image.info.guest_size;
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];
@@ -3331,7 +3401,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
                         (unsigned long long)image.info.guest_address, image.info.size.width,
                         image.info.size.height, u32(image.info.pixel_format),
                         u32(image.info.tile_mode), (unsigned long long)image.info.guest_size,
-                        (unsigned long long)device_addr, size,
+                        (unsigned long long)device_addr, u32(size),
                         image.gpu_write_tick ? (long long)(scheduler.CurrentTick() -
                                                            image.gpu_write_tick)
                                              : -1ll,

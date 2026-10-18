@@ -76,10 +76,22 @@ fi
 "$PYTHON" scripts/link_libc.py "$game" --out "$out"
 "$PYTHON" scripts/link_modules.py "$game" --out "$out"
 "$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}"
-# Ratchet & Clank (2016; CUSA01073, the US CUSA01047 untested) gets its own defaults below.
+# Ratchet & Clank (2016; CUSA01073, the US CUSA01047 untested) and LittleBigPlanet 3
+# (CUSA00063, the European release) get their own defaults below.
 title=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["sfo"].get("TITLE_ID", ""))' "$out/analysis.json" 2>/dev/null) || title=
-ratchet=0
+ratchet=0 lbp3=0
 [[ $title == CUSA01073 || $title == CUSA01047 ]] && ratchet=1
+[[ $title == CUSA00063 ]] && lbp3=1
+# LittleBigPlanet 3 needs these (each one set by hand wins):
+# - BB_IMAGE_BASE: the executable below 4 GiB, as the SPU job code keeps its globals in 32 bits;
+# - BB_STUB_IMPORTS: system functions the runtime lacks return 0 instead of stopping the game;
+# - BB_NP_SIGNED_IN, BB_LOCAL_UDP: signed in to PSN with the game's servers unreachable (as on a
+#   PS4 since they closed), so the online check fails and the game goes on offline.
+if (( lbp3 )); then
+    export BB_IMAGE_BASE=${BB_IMAGE_BASE:-0x80000000}
+    export BB_STUB_IMPORTS=${BB_STUB_IMPORTS:-1}
+    export BB_NP_SIGNED_IN=${BB_NP_SIGNED_IN:-1} BB_LOCAL_UDP=${BB_LOCAL_UDP:-1}
+fi
 # Sizes chosen below for the previous launch are recomputed after an in-game restart.
 if [[ ${BB_AUTO_RENDER_RES:-} == 1 ]]; then
     unset BB_RENDER_RES BB_OUTPUT_RES BB_AUTO_RENDER_RES
@@ -87,8 +99,11 @@ fi
 # BB_RENDER_RES=WxH explicitly sets the game's render resolution (a patch at start).
 # Frame rate: BB_FPS=uncap (default; delta-time patch, vblank 480 Hz, frames shown at once),
 # 60/90 (fixed-timestep patches) or 30 (unpatched); Ratchet & Clank also 120 (its frame pacing
-# interval, scripts/patches.py; its default is 60). BB_PATCHES adds patch names ("a;b").
-if (( ratchet )); then fps=${BB_FPS:-60}; else fps=${BB_FPS:-uncap}; fi
+# interval, scripts/patches.py; its default is 60). LittleBigPlanet 3 runs at 30, the rate it
+# was made and tested for. BB_PATCHES adds patch names ("a;b").
+if (( ratchet )); then fps=${BB_FPS:-60}
+elif (( lbp3 )); then fps=${BB_FPS:-30}
+else fps=${BB_FPS:-uncap}; fi
 # bbport.ini output_res other than 1080p (720p for the Steam Deck, 1440p, 2160p): the whole game
 # renders at the preset's size of the output (a patch), the upscaler fills the output, the UI is
 # drawn at the output size. Preset and output changes need a restart.

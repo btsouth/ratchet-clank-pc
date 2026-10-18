@@ -18,4 +18,13 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
 
+/// One stage's cache entry (RegisterShaderMeta's blob) and its reader. LoadShaderMeta sets
+/// fetch_shader_data only from a stage that has a fetch shader (the pipeline's other stages
+/// leave it).
+void WriteShaderMeta(Serialization::Archive& ar, const Shader::Info& info,
+                     const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+                    Shader::StageSpecialization& spec, size_t& perm_idx);
+
 } // namespace Vulkan

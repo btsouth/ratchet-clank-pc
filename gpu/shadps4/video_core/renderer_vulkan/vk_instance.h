@@ -418,6 +418,11 @@ public:
         return properties.limits.nonCoherentAtomSize;
     }
 
+    /// bbport: address space for sparse resources (lavapipe: 2 GiB).
+    u64 SparseAddressSpaceSize() const {
+        return properties.limits.sparseAddressSpaceSize;
+    }
+
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
         return vk11_props.subgroupSize;

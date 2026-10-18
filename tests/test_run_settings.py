@@ -19,6 +19,7 @@ class RestartResolutionTests(unittest.TestCase):
             # validate writes against a single ELF load segment spanning the game image.
             out = data / 'out'
             out.mkdir()
+            # Bloodborne: the built-in patches are its addresses (patches.py reads the title).
             (out / 'analysis.json').write_text(json.dumps({'sfo': {'TITLE_ID': 'CUSA03173'}}))
             elf = bytearray(120)
             struct.pack_into('<Q', elf, 0x20, 64)
@@ -268,3 +269,68 @@ class RatchetDefaultTests(unittest.TestCase):
         self.assertEqual(env['BB_VBLANK_HZ'], '60')
         env = self.launch(title='CUSA03173', vendor='0x1002')
         self.assertEqual((env['BB_PC_MODEL'], env['BB_VBLANK_HZ']), ('1', '480'))
+
+
+LBP3_KEYS = ('BB_IMAGE_BASE', 'BB_STUB_IMPORTS', 'BB_NP_SIGNED_IN', 'BB_LOCAL_UDP', 'BB_VBLANK_HZ')
+
+
+class Lbp3DefaultTests(unittest.TestCase):
+    """LittleBigPlanet 3 runs with no variables set: run.sh picks its settings by TITLE_ID."""
+
+    def launch(self, title='CUSA00063', **extra):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            out = data / 'out'
+            out.mkdir()
+            (out / 'analysis.json').write_text(json.dumps({'sfo': {'TITLE_ID': title}}))
+            elf = bytearray(120)
+            struct.pack_into('<Q', elf, 0x20, 64)
+            struct.pack_into('<HH', elf, 0x36, 56, 1)
+            struct.pack_into('<IIQQQQQQ', elf, 64, 1, 0, 0, 0, 0, 0, 0x6000000, 0)
+            (out / 'eboot.elf').write_bytes(elf)
+            (data / 'eboot.bin').touch()
+            config = data / 'bbport.ini'
+            config.write_text('')
+            caps = data / 'bb-gpu-capabilities'  # next to the probe, as run.sh looks for it
+            caps.write_text('#!/bin/sh\nexit 1\n')
+            caps.chmod(0o755)
+            python = data / 'python'
+            python.write_text(f'#!{sys.executable}\n' +
+                'import subprocess, sys\n'
+                'if sys.argv[1] in ("scripts/patches.py", "scripts/mods.py", "-c"):\n'
+                '    sys.exit(subprocess.call([sys.executable, *sys.argv[1:]]))\n')
+            python.chmod(0o755)
+            probe = data / 'probe'
+            probe.write_text(f'#!{sys.executable}\n' +
+                'import json, os, sys\n'
+                'from pathlib import Path\n'
+                f'keys = {LBP3_KEYS!r}\n'
+                'Path(os.environ["BB_CONFIG"]).with_name("environment").write_text(json.dumps('
+                '{key: os.environ.get(key) for key in keys}))\n')
+            probe.chmod(0o755)
+            env = dict(os.environ, BB_PREBUILT='1', BB_PROBE=str(probe), PYTHON=str(python),
+                       BB_DATA_DIR=str(data), BB_CONFIG=str(config), BB_GAME_DIR=str(data))
+            for key in LBP3_KEYS + ('BB_FPS', 'BB_LIVE_RES', 'BB_AUTO_RENDER_RES'):
+                env.pop(key, None)
+            env.update(extra)
+            subprocess.run([shutil.which('bash'), 'run.sh'], cwd=ROOT, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
+            return json.loads((data / 'environment').read_text())
+
+    def test_required_settings_without_variables(self):
+        env = self.launch()
+        self.assertEqual({key: env[key] for key in LBP3_KEYS[:4]}, {
+            'BB_IMAGE_BASE': '0x80000000', 'BB_STUB_IMPORTS': '1', 'BB_NP_SIGNED_IN': '1',
+            'BB_LOCAL_UDP': '1'})
+
+    def test_explicit_values_win(self):
+        env = self.launch(BB_NP_SIGNED_IN='0', BB_IMAGE_BASE='0x800000000')
+        self.assertEqual((env['BB_NP_SIGNED_IN'], env['BB_IMAGE_BASE']), ('0', '0x800000000'))
+
+    def test_default_rate_is_30_as_set_by_hand(self):
+        self.assertEqual(self.launch()['BB_VBLANK_HZ'], self.launch(BB_FPS='30')['BB_VBLANK_HZ'])
+
+    def test_bloodborne_gets_none_of_them(self):
+        env = self.launch(title='CUSA03173')
+        for key in LBP3_KEYS[:4]:
+            self.assertIsNone(env[key], key)

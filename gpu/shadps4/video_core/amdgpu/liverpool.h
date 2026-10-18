@@ -361,4 +361,8 @@ private:
     s32 curr_qid{-1};
 };
 
+/// bbport (diagnostics): prints what the graphics and compute queues wait for (a game's GPU
+/// watchdog fired: sceGnmDebugHardwareStatus).
+void ReportQueueWait();
+
 } // namespace AmdGpu

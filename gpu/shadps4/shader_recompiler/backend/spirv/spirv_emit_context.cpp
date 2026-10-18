@@ -522,8 +522,14 @@ void EmitContext::DefineInputs() {
         gl_in = Name(DefineVar(vertices_in, spv::StorageClass::Input), "gl_in");
         interfaces.push_back(gl_in);
 
+        // bbport: only the parameters the shader reads. The ES-GS ring item may hold more
+        // (LBP3: 31 x vec4 plus gl_in is over maxGeometryInputComponents, 128, and the vertex
+        // shader writes fewer: VUID-RuntimeSpirv-Location-06272 and OpEntryPoint-08743).
         const auto num_params = runtime_info.hw.gs.in_vertex_data_size / 4 - 1u;
         for (int param_id = 0; param_id < num_params; ++param_id) {
+            if (!info.loads.GetAny(IR::Attribute::Param0 + param_id)) {
+                continue;
+            }
             const Id type{TypeArray(F32[4], ConstU32(num_verts_in))};
             const Id id{DefineInput(type, param_id)};
             Name(id, fmt::format("gs_in_attr{}", param_id));

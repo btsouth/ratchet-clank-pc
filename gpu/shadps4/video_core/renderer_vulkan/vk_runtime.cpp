@@ -14,8 +14,22 @@
 #include "video_core/texture_cache/image.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+namespace {
+/// bbport: a recording chunk holds 128 KiB with the command: longer region lists (LBP3 syncs a
+/// buffer in thousands of pieces while loading a level) are recorded as several commands, in
+/// order. Nothing between them needs a barrier: they are the regions of one copy.
+template <typename T, typename F>
+void ForEachRecordPart(std::span<const T> items, F&& record) {
+    constexpr size_t MaxItems = (RecordChunk::Capacity - 4096) / sizeof(T);
+    for (size_t at = 0; at < items.size(); at += MaxItems) {
+        record(items.subspan(at, std::min(MaxItems, items.size() - at)));
+    }
+}
+} // namespace
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
@@ -31,6 +45,15 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     default:
         UNREACHABLE_MSG("Unexpected image type {}", u32(type));
     }
+}
+
+/// bbport: the depth slices a range of a volume names as layers (render target views of a
+/// volume address its slices that way), clamped to the slices of the range's mip level.
+static std::pair<u32, u32> VolumeSlices(const VideoCore::ImageInfo& info,
+                                        const VideoCore::SubresourceRange& range) {
+    const u32 depth = std::max(info.size.depth >> range.base.level, 1u);
+    const u32 first = std::min(range.base.layer, depth - 1);
+    return {first, std::clamp(range.extent.layers, 1u, depth - first)};
 }
 
 static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_info,
@@ -142,9 +165,11 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
-    scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
-                      regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
+    ForEachRecordPart(copies, [&](std::span<const vk::BufferCopy> part) {
+        scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
+                          regions = scheduler.RecordData(part)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyBuffer(src_handle, dst_handle, regions.size(), regions.data());
+        });
     });
 
     if (bounded) {
@@ -190,9 +215,11 @@ void Runtime::CopyFromGuestChunk(vk::Buffer src, const VideoCore::Buffer* dst,
     if (needs_flush) {
         FlushBarriers();
     }
-    scheduler.Record([src, dst_handle = dst->Handle(),
-                      regions = scheduler.RecordData(copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBuffer(src, dst_handle, regions.size(), regions.data());
+    ForEachRecordPart(copies, [&](std::span<const vk::BufferCopy> part) {
+        scheduler.Record([src, dst_handle = dst->Handle(),
+                          regions = scheduler.RecordData(part)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyBuffer(src, dst_handle, regions.size(), regions.data());
+        });
     });
     for (const auto& copy : copies) {
         AccessBuffer(dst, copy.dstOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
@@ -286,10 +313,12 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         FlushBarriers();
     }
 
-    scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
-                      regions = scheduler.RecordData(upload_copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
-                                 regions.size(), regions.data());
+    ForEachRecordPart(upload_copies, [&](std::span<const vk::BufferImageCopy> part) {
+        scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
+                          regions = scheduler.RecordData(part)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
+                                     regions.size(), regions.data());
+        });
     });
 
     for (const auto& copy : upload_copies) {
@@ -318,10 +347,12 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         FlushBarriers();
     }
 
-    scheduler.Record([image = src->GetImage(), buffer = dst->Handle(),
-                      regions = scheduler.RecordData(download_copies)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer,
-                                 regions.size(), regions.data());
+    ForEachRecordPart(download_copies, [&](std::span<const vk::BufferImageCopy> part) {
+        scheduler.Record([image = src->GetImage(), buffer = dst->Handle(),
+                          regions = scheduler.RecordData(part)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+                                     regions.size(), regions.data());
+        });
     });
 
     for (const auto& copy : download_copies) {
@@ -517,9 +548,11 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         .dstSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = mip,
-            .baseArrayLayer = slice,
+            .baseArrayLayer = dst->info.props.is_volume ? 0 : slice,
             .layerCount = dst_layers,
         },
+        // bbport: a volume's slice is a depth offset (3D images have one layer).
+        .dstOffset = {0, 0, dst->info.props.is_volume ? static_cast<s32>(slice) : 0},
         .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
 
@@ -642,24 +675,38 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
+    // bbport: a volume's slices are its depth (one array layer, offset z), not layers, which
+    // Vulkan does not allow on 3D images. Layer counts come from the ranges, not the whole
+    // images, so a range starting past layer 0 stays inside them.
+    const bool src_3d = src->info.props.is_volume;
+    const bool dst_3d = dst->info.props.is_volume;
+    const auto [src_first, src_count] =
+        src_3d ? VolumeSlices(src->info, src_range)
+               : std::pair{src_range.base.layer, src_range.extent.layers};
+    const auto [dst_first, dst_count] =
+        dst_3d ? VolumeSlices(dst->info, dst_range)
+               : std::pair{dst_range.base.layer, dst_range.extent.layers};
+    const u32 count = std::min(src_count, dst_count);
+    const auto subresource = [](bool is_3d, u32 first, u32 n) {
+        return vk::ImageSubresourceLayers{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = is_3d ? 0 : first,
+            .layerCount = is_3d ? 1 : n,
+        };
+    };
+    const auto offset = [](bool is_3d, u32 first) {
+        return vk::Offset3D{0, 0, is_3d ? static_cast<s32>(first) : 0};
+    };
+    const u32 width = std::min(src->info.size.width, dst->info.size.width);
+    const u32 height = std::min(src->info.size.height, dst->info.size.height);
     if (!needs_resolve) {
         const vk::ImageCopy region = {
-            .srcSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
-            },
-            .srcOffset = {0, 0, 0},
-            .dstSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
-            },
-            .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
+            .srcSubresource = subresource(src_3d, src_first, count),
+            .srcOffset = offset(src_3d, src_first),
+            .dstSubresource = subresource(dst_3d, dst_first, count),
+            .dstOffset = offset(dst_3d, dst_first),
+            .extent = {width, height, (src_3d || dst_3d) ? count : 1u},
         };
         scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
                           region](vk::CommandBuffer cmdbuf) {
@@ -667,27 +714,23 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                              vk::ImageLayout::eTransferDstOptimal, region);
         });
     } else {
-        const vk::ImageResolve region = {
-            .srcSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
-            },
-            .srcOffset = {0, 0, 0},
-            .dstSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
-            },
-            .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
-        };
+        // A multisampled source is 2D; into a volume, resolve one slice per region.
+        boost::container::small_vector<vk::ImageResolve, 8> regions;
+        const u32 steps = dst_3d ? count : 1u;
+        for (u32 i = 0; i < steps; ++i) {
+            const u32 n = dst_3d ? 1u : count;
+            regions.push_back(vk::ImageResolve{
+                .srcSubresource = subresource(false, src_first + i, n),
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = subresource(dst_3d, dst_first + i, n),
+                .dstOffset = offset(dst_3d, dst_first + i),
+                .extent = {width, height, 1},
+            });
+        }
         scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
-                          region](vk::CommandBuffer cmdbuf) {
+                          regions](vk::CommandBuffer cmdbuf) {
             cmdbuf.resolveImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
-                                vk::ImageLayout::eTransferDstOptimal, region);
+                                vk::ImageLayout::eTransferDstOptimal, regions);
         });
     }
 
@@ -699,6 +742,11 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
                          const vk::ClearValue& clear_value) {
     scheduler.EndRendering();
 
+    if (dst->info.props.is_volume) {
+        ClearVolumeSlices(dst, range, clear_value);
+        return;
+    }
+
     const bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
                 vk::AccessFlagBits2::eTransferWrite, range);
@@ -706,20 +754,161 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         FlushBarriers();
     }
 
+    // bbport: a depth (and stencil) image takes clear_value.depthStencil.
+    const bool is_depth = dst->info.props.is_depth;
     const vk::ImageSubresourceRange vk_range = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .aspectMask = is_depth ? dst->aspect_mask : vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,
         .levelCount = range.extent.levels,
         .baseArrayLayer = range.base.layer,
         .layerCount = range.extent.layers,
     };
-    scheduler.Record([image = dst->GetImage(), color = clear_value.color,
-                      vk_range](vk::CommandBuffer cmdbuf) {
-        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
-    });
+    if (is_depth) {
+        scheduler.Record([image = dst->GetImage(), depth_stencil = clear_value.depthStencil,
+                          vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearDepthStencilImage(image, vk::ImageLayout::eTransferDstOptimal,
+                                          depth_stencil, vk_range);
+        });
+    } else {
+        scheduler.Record([image = dst->GetImage(), color = clear_value.color,
+                          vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+        });
+    }
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+// bbport: a range of a volume names depth slices as layers (render targets of one slice). A
+// 3D image has one array layer, so vkCmdClearColorImage can only clear all of its slices; a
+// part is cleared by a render pass over a 2D array view of those slices (the image is
+// 2D-array compatible).
+void Runtime::ClearVolumeSlices(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
+                                const vk::ClearValue& clear_value) {
+    const auto [first, count] = VolumeSlices(dst->info, range);
+    const u32 level = range.base.level;
+    const u32 depth = std::max(dst->info.size.depth >> level, 1u);
+    if (first == 0 && count >= depth) {
+        const bool needs_flush = Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                                         vk::PipelineStageFlagBits2::eClear,
+                                         vk::AccessFlagBits2::eTransferWrite, range);
+        if (needs_flush) {
+            FlushBarriers();
+        }
+        const vk::ImageSubresourceRange vk_range = {
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = level,
+            .levelCount = range.extent.levels,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        scheduler.Record([image = dst->GetImage(), color = clear_value.color,
+                          vk_range](vk::CommandBuffer cmdbuf) {
+            cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
+        });
+    } else {
+        VideoCore::ImageViewInfo view_info;
+        view_info.type =
+            count > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
+        view_info.format = dst->info.pixel_format;
+        view_info.range.base = {.level = level, .layer = first};
+        view_info.range.extent = {.levels = 1, .layers = count};
+        const vk::ImageView view = *dst->FindView(view_info).image_view;
+        const bool needs_flush =
+            Transit(dst, vk::ImageLayout::eColorAttachmentOptimal,
+                    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                    vk::AccessFlagBits2::eColorAttachmentWrite, range);
+        if (needs_flush) {
+            FlushBarriers();
+        }
+        const vk::Extent2D extent{std::max(dst->info.size.width >> level, 1u),
+                                  std::max(dst->info.size.height >> level, 1u)};
+        scheduler.Record([view, extent, count, color = clear_value.color](vk::CommandBuffer cmdbuf) {
+            const vk::RenderingAttachmentInfo attachment = {
+                .imageView = view,
+                .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .loadOp = vk::AttachmentLoadOp::eClear,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+                .clearValue = vk::ClearValue{.color = color},
+            };
+            cmdbuf.beginRendering(vk::RenderingInfo{
+                .renderArea = {{0, 0}, extent},
+                .layerCount = count,
+                .colorAttachmentCount = 1,
+                .pColorAttachments = &attachment,
+            });
+            cmdbuf.endRendering();
+        });
+    }
+
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+u64 Runtime::DumpImage(VideoCore::Image* image, u32 layer, const std::string& path) {
+    const auto& info = image->info;
+    if (!image->backing || image->backing->num_samples != 1 ||
+        info.pixel_format == vk::Format::eUndefined) {
+        return 0;
+    }
+    const bool depth = static_cast<bool>(image->aspect_mask & vk::ImageAspectFlagBits::eDepth);
+    const vk::Format format = info.pixel_format;
+    u32 texel = 0;
+    if (depth) {
+        texel = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint ? 2 : 4;
+    } else if (vk::blockExtent(format)[0] == 1) {
+        texel = vk::blockSize(format);
+    }
+    if (texel == 0) {
+        return 0; // compressed
+    }
+    const u32 width = info.size.width, height = info.size.height;
+    const u64 size = u64(width) * height * texel;
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo alloc_info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                        &alloc_info) != VK_SUCCESS) {
+        return 0;
+    }
+    scheduler.EndRendering();
+    if (Transit(image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead)) {
+        FlushBarriers();
+    }
+    const bool volume = info.props.is_volume;
+    const u32 slice = std::min(layer, (volume ? info.size.depth : info.resources.layers) - 1);
+    const vk::BufferImageCopy region{
+        .imageSubresource = {depth ? vk::ImageAspectFlagBits::eDepth
+                                   : vk::ImageAspectFlagBits::eColor,
+                             0, volume ? 0 : slice, 1},
+        .imageOffset = {0, 0, volume ? s32(slice) : 0},
+        .imageExtent = {width, height, 1},
+    };
+    scheduler.Record([src = image->GetImage(), dst = vk::Buffer{buffer},
+                      region](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImageToBuffer(src, vk::ImageLayout::eTransferSrcOptimal, dst, region);
+    });
+    scheduler.DeferPriorityOperation(
+        [allocator = instance.GetAllocator(), buffer, allocation, alloc_info, size, path] {
+            vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(alloc_info.pMappedData, 1, size, f);
+                std::fclose(f);
+            }
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        });
+    return size;
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {

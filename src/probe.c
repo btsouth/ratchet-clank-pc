@@ -159,6 +159,77 @@ static ABI uint64_t stubbed(uint32_t id, uintptr_t argument) {
     }
     return 0;
 }
+/* BB_COUNT_IMPORTS=1 (porting): every host import goes through a stub that counts its calls
+ * (lock inc, then a jump; only r11 and the flags change), the first calls of each are printed
+ * and the busiest imports every 5 s: what a game polls while it waits shows where it is stuck. */
+static uint64_t *call_counts;
+static unsigned char *count_stubs;
+/* The first CALL_LOG calls of each counted import are also printed with three arguments and the
+ * caller: the stub jumps to count_log_slow with r11 = &call_records[id] ({id, target}). */
+enum { CALL_LOG = 3, COUNT_STUB = 64 };
+typedef struct { uint64_t id; uintptr_t target; } CallRecord;
+static CallRecord *call_records;
+__attribute__((used)) static void count_log(const CallRecord *r, uint64_t a0, uint64_t a1, uint64_t a2, uintptr_t ret) {
+    const char *symbol = runtime_symbol(names[r->id]);
+    printf("CALL: %s(%#llx, %#llx, %#llx) from +%#llx\n", symbol ? symbol : names[r->id], (unsigned long long)a0,
+           (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)(ret - (uintptr_t)image));
+}
+void count_log_slow(void) __asm__("count_log_slow");
+__asm__(".text\ncount_log_slow:\n"
+        " push %rdi\n push %rsi\n push %rdx\n push %rcx\n push %r8\n push %r9\n push %rax\n push %r11\n"
+        " sub $136,%rsp\n"
+        " movdqu %xmm0,0(%rsp)\n movdqu %xmm1,16(%rsp)\n movdqu %xmm2,32(%rsp)\n movdqu %xmm3,48(%rsp)\n"
+        " movdqu %xmm4,64(%rsp)\n movdqu %xmm5,80(%rsp)\n movdqu %xmm6,96(%rsp)\n movdqu %xmm7,112(%rsp)\n"
+        " mov %r11,%rdi\n mov 192(%rsp),%rsi\n mov 184(%rsp),%rdx\n mov 176(%rsp),%rcx\n mov 200(%rsp),%r8\n"
+        " call count_log\n"
+        " movdqu 0(%rsp),%xmm0\n movdqu 16(%rsp),%xmm1\n movdqu 32(%rsp),%xmm2\n movdqu 48(%rsp),%xmm3\n"
+        " movdqu 64(%rsp),%xmm4\n movdqu 80(%rsp),%xmm5\n movdqu 96(%rsp),%xmm6\n movdqu 112(%rsp),%xmm7\n"
+        " add $136,%rsp\n"
+        " pop %r11\n pop %rax\n pop %r9\n pop %r8\n pop %rcx\n pop %rdx\n pop %rsi\n pop %rdi\n"
+        " jmp *8(%r11)\n");
+static uintptr_t counted(uint64_t id, uintptr_t target) {
+    unsigned char *t = count_stubs + id * COUNT_STUB;
+    if (t[0] != 0x49) {
+        uintptr_t counter = (uintptr_t)&call_counts[id], record = (uintptr_t)&call_records[id], slow = (uintptr_t)count_log_slow;
+        call_records[id] = (CallRecord){id, target};
+        t[0] = 0x49; t[1] = 0xbb; memcpy(t + 2, &counter, 8);    /* movabs r11, counter */
+        t[10] = 0xf0; t[11] = 0x49; t[12] = 0xff; t[13] = 0x03;   /* lock inc qword [r11] */
+        t[14] = 0x49; t[15] = 0x83; t[16] = 0x3b; t[17] = CALL_LOG; /* cmp qword [r11], CALL_LOG */
+        t[18] = 0x77; t[19] = 16;                                 /* ja +16 (the fast path) */
+        t[20] = 0x49; t[21] = 0xbb; memcpy(t + 22, &record, 8);   /* movabs r11, record */
+        t[30] = 0xff; t[31] = 0x25; uint32_t rel = 13; memcpy(t + 32, &rel, 4); /* jmp [rip+13] */
+        t[36] = 0x49; t[37] = 0xbb; memcpy(t + 38, &target, 8);   /* movabs r11, target */
+        t[46] = 0x41; t[47] = 0xff; t[48] = 0xe3;                 /* jmp r11 */
+        memcpy(t + 49, &slow, 8);                                 /* count_log_slow */
+    }
+    return (uintptr_t)t;
+}
+#ifndef _WIN32
+static void *count_report(void *unused) {
+    (void)unused;
+    uint64_t *last = calloc(import_count, sizeof(*last));
+    for (;;) {
+        sleep(5);
+        uint64_t *now = calloc(import_count, sizeof(*now));
+        for (uint64_t i = 0; i < import_count; ++i) now[i] = __atomic_load_n(&call_counts[i], __ATOMIC_RELAXED);
+        printf("Import calls, last 5 s:");
+        for (int k = 0; k < 12; ++k) {
+            uint64_t best = 0, at = 0;
+            for (uint64_t i = 0; i < import_count; ++i) {
+                uint64_t d = now[i] - last[i];
+                if (d > best) { best = d; at = i; }
+            }
+            if (!best) break;
+            last[at] += best;
+            printf(" %s=%llu", runtime_symbol(names[at]) ? runtime_symbol(names[at]) : names[at], (unsigned long long)best);
+        }
+        memcpy(last, now, import_count * sizeof(*now));
+        free(now);
+        printf("\n");
+    }
+    return NULL;
+}
+#endif
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
@@ -421,7 +492,8 @@ int main(int argc, char **argv) {
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
+    runtime_thread_alt_stack();
+    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO|SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
     Dl_info self_info;
@@ -479,7 +551,7 @@ int main(int argc, char **argv) {
             LinkedModule *x=&modules[m];
             if (x->base>=size || !x->size || x->size>size-x->base || x->init<x->base || x->init-x->base>=x->size ||
                 (x->tls_module && (x->tls_address>=size || x->tls_memsz>size-x->tls_address || x->tls_memsz>1024*1024 ||
-                                   x->tls_filesz>x->tls_memsz || x->tls_module<2 || x->tls_module>7)))
+                                   x->tls_filesz>x->tls_memsz || x->tls_module<2 || x->tls_module>15)))
                 fail("invalid linked module metadata");
         }
         if (nb>import_count) fail("invalid binding count");
@@ -530,6 +602,19 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
+#ifndef _WIN32
+    const char *image_base_env=getenv("BB_IMAGE_BASE");
+    if (image_base_env && *image_base_env) {
+        char *end;
+        uint64_t base=strtoull(image_base_env,&end,0);
+        if (*end || base<65536 || base%page_size || base>UINT64_C(0x10000000000)-round_page(size))
+            fail("invalid BB_IMAGE_BASE (aligned guest address required)");
+        image=mmap((void *)(uintptr_t)base,round_page(size),PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+        if (image==MAP_FAILED) fail("BB_IMAGE_BASE is unavailable (existing mappings preserved)");
+        printf("Image base: %#" PRIx64 " (BB_IMAGE_BASE)\n",base);
+    } else
+#endif
     image = allocate(round_page(size));
     runtime_sse4a_init((uintptr_t)image);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
@@ -550,6 +635,12 @@ int main(int argc, char **argv) {
     }
     const char *stub_env = getenv("BB_STUB_IMPORTS");
     if (stub_env && !strcmp(stub_env, "1")) stub_seen = calloc(import_count + 1, 1);
+    const char *count_env = getenv("BB_COUNT_IMPORTS");
+    if (count_env && !strcmp(count_env, "1")) {
+        call_counts = calloc(import_count + 1, sizeof(*call_counts));
+        call_records = calloc(import_count + 1, sizeof(*call_records));
+        count_stubs = allocate(round_page((import_count + 1) * COUNT_STUB));
+    }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
@@ -563,12 +654,28 @@ int main(int argc, char **argv) {
         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
         t[18] = 0xff; t[19] = 0xe0;
     }
+    /* BB_REPORT_IMPORTS=1 (porting other games): how each import is served, once, before the
+     * game runs: "host" (the runtime or the GPU library), "native" (a linked module's export)
+     * or "MISSING" (a trap: STOP, or 0 with BB_STUB_IMPORTS=1). */
+    const char *report_env = getenv("BB_REPORT_IMPORTS");
+    if (report_env && !strcmp(report_env, "1")) {
+        uint64_t missing = 0;
+        for (uint64_t i = 0; i < import_count; ++i) {
+            int data = 0;
+            for (uint64_t r = 0; r < nr; ++r) if (relocs[r].kind && relocs[r].value == i) { data = relocs[r].kind == 2; break; }
+            const char *how = runtime_resolve(names[i], data) ? "host" : native_libc && bindings[i] ? "native" : "MISSING";
+            missing += how[0] == 'M';
+            printf("IMPORT: %-7s %s %s\n", how, names[i], runtime_import_name(names[i]));
+        }
+        printf("IMPORT: %" PRIu64 " of %" PRIu64 " imports missing\n", missing, import_count);
+    }
     for (uint64_t i = 0; i < nr; ++i) {
         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
             uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
+            if (resolved && relocs[i].kind == 1 && call_counts) resolved = counted(relocs[i].value, resolved);
             if (resolved) value = resolved + relocs[i].addend;
             else if (native_libc && bindings[relocs[i].value]) {
                 uint64_t address=bindings[relocs[i].value];
@@ -581,6 +688,14 @@ int main(int argc, char **argv) {
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     if (!cpu_only) bbgpu_patch_image(image, size);
     protect(traps, round_page((import_count + 1) * 32), 5);
+    if (count_stubs) {
+        protect(count_stubs, round_page((import_count + 1) * COUNT_STUB), 5);
+#ifndef _WIN32
+        pthread_t reporter;
+        pthread_create(&reporter, NULL, count_report, NULL);
+        pthread_detach(reporter);
+#endif
+    }
     protect(image, round_page(size), 0);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {

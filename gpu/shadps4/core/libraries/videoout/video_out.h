@@ -143,4 +143,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
+/// bbport (diagnostics): prints the flip state (VideoOutDriver::ReportFlipState).
+void ReportFlipState();
+
 } // namespace Libraries::VideoOut

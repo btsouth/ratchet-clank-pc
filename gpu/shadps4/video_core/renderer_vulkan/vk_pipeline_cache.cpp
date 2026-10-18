@@ -1311,6 +1311,37 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    // bbport BB_DUMP_SHADER_CODE=hash,... (diagnostics): the guest code of those programs
+    // (64-bit hash or its low 32 bits, hex), once, into BB_CAPTURE_DIR (or .) as
+    // <stage>_<hash>.gcn, also when they come from the cache (BB_DUMP_SHADERS needs a compile).
+    static const std::vector<u64> dump_code = [] {
+        std::vector<u64> out;
+        for (const char* p = std::getenv("BB_DUMP_SHADER_CODE"); p && *p;) {
+            char* end = nullptr;
+            out.push_back(std::strtoull(p, &end, 16));
+            p = end && *end == ',' ? end + 1 : nullptr;
+        }
+        return out;
+    }();
+    if (!dump_code.empty() && !sel.worker &&
+        std::ranges::any_of(dump_code, [&](u64 h) {
+            return h == params.hash || h == (params.hash & 0xffffffffull);
+        })) {
+        static std::mutex dumped_mutex;
+        static std::vector<u64> dumped;
+        std::scoped_lock lk{dumped_mutex};
+        if (std::ranges::find(dumped, params.hash) == dumped.end()) {
+            dumped.push_back(params.hash);
+            const char* dir = std::getenv("BB_CAPTURE_DIR");
+            const auto path = fmt::format("{}/{}_{:016x}.gcn", dir ? dir : ".", hw_stage,
+                                          params.hash);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(params.code.data(), 4, params.code.size(), f);
+                std::fclose(f);
+                std::printf("Shader code: %s (%zu dwords)\n", path.c_str(), params.code.size());
+            }
+        }
+    }
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     if (sel.worker) {
         // bbport: draw-preparation worker: look up only, with the worker's own Info copy.

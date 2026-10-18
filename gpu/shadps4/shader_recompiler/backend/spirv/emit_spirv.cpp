@@ -387,7 +387,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
 }
 
-void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
+void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main, const IR::Program& program) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
     spv::ExecutionModel execution_model{};
     switch (info.sw_stage) {
@@ -436,7 +436,7 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         ctx.AddExecutionMode(main, GetInputPrimitiveType(ctx.runtime_info.hw.gs.in_primitive));
         ctx.AddExecutionMode(main, GetOutputPrimitiveType(ctx.runtime_info.hw.gs.out_primitive[0]));
         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices,
-                             ctx.runtime_info.hw.gs.output_vertices);
+                             GeometryOutputVertexLimit(program, ctx.runtime_info.hw.gs.output_vertices));
         ctx.AddExecutionMode(main, spv::ExecutionMode::Invocations,
                              ctx.runtime_info.hw.gs.num_invocations);
         break;
@@ -654,11 +654,30 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 }
 } // Anonymous namespace
 
+u32 GeometryOutputVertexLimit(const IR::Program& program, u32 declared) {
+    u32 emits = 0;
+    for (const auto& node : program.syntax_list) {
+        // A loop may execute each emission site arbitrarily often. Keep the guest bound.
+        if (node.type == IR::AbstractSyntaxNode::Type::Loop ||
+            node.type == IR::AbstractSyntaxNode::Type::Repeat) {
+            return declared;
+        }
+        if (node.type == IR::AbstractSyntaxNode::Type::Block) {
+            for (const auto& inst : node.data.block->Instructions()) {
+                emits += inst.GetOpcode() == IR::Opcode::EmitVertex;
+            }
+        }
+    }
+    // Branch alternatives may overestimate the count, which remains a safe upper bound.
+    // Do not raise the guest limit or turn an empty shader into an invalid zero-sized output.
+    return emits ? std::min(declared, emits) : declared;
+}
+
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
     const Id main{DefineMain(ctx, program)};
-    DefineEntryPoint(program.info, ctx, main);
+    DefineEntryPoint(program.info, ctx, main, program);
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);

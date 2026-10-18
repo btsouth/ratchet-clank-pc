@@ -245,6 +245,12 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
+    if (subres_range && info.props.is_volume) {
+        // bbport: a 2D view of a volume names a slice as its layer; a 3D image has one layer
+        // in barriers (its slices share the layout).
+        subres_range->base.layer = 0;
+        subres_range->extent.layers = 1;
+    }
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 

@@ -21,6 +21,8 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/videoout/flip_trace.h"
+#include "core/libraries/videoout/video_out.h"
 
 namespace Libraries::Kernel {
 
@@ -182,6 +184,9 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     if (timo != nullptr && *timo == 0) {
         // Effectively acts as a poll; only events that have already
         // arrived at the time of this function call can be received
+        // bbport: under the lock, as upstream: a poll racing a trigger could read and clear an
+        // event while TriggerEvent wrote it, losing that trigger.
+        std::scoped_lock lock{m_mutex};
         return GetTriggeredEvents(ev, num);
     }
     const auto micros = timo ? *timo : 0u;
@@ -512,8 +517,24 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    const bool flip_queue = equeue->EventExists(
+        static_cast<u64>(VideoOut::OrbisVideoOutInternalEventId::Flip), OrbisKernelEvent::Filter::VideoOut);
+    if (flip_queue) {
+        VideoOut::FlipTrace::Note(VideoOut::FlipTrace::WaitBegin, timo ? s64(*timo) : -1);
+    }
     const auto wait_start = std::chrono::steady_clock::now();
     *out = equeue->WaitForEvents(ev, num, timo);
+    if (flip_queue) {
+        VideoOut::FlipTrace::Note(VideoOut::FlipTrace::WaitEnd, *out);
+        // bbport (diagnostics): a guest waiting half a second for a flip (games trap at 1 s).
+        static std::atomic<u32> reports{0};
+        static thread_local u32 timeouts = 0;
+        timeouts = *out == 0 ? timeouts + 1 : 0;
+        if (timeouts == 5 && timo && *timo >= 50000 && reports.fetch_add(1) < 3) {
+            std::printf("Guest waited %u ms for a flip:\n", 5 * (*timo / 1000));
+            VideoOut::ReportFlipState();
+        }
+    }
     {
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)

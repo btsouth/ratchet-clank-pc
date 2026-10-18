@@ -115,9 +115,22 @@ class GameCheckTests(unittest.TestCase):
         os.environ['BB_SKIP_GAME_CHECK'] = '1'
         self.assertIsNone(game_check.problem(self.game('CUSA03173', '01.00')))
 
+    def test_lbp3_image_passes(self):
+        game = self.game('CUSA00063', '01.00')
+        with mock.patch.object(game_check, 'LBP3_IMAGE', game_check.image_sha256(game)):
+            self.assertIsNone(game_check.problem(game))
+
+    def test_other_lbp3_executable_only_warns(self):
+        found = game_check.problem(self.game('CUSA00063', '01.00'))
+        self.assertEqual(found, ('lbp3_untested', 'CUSA00063', '01.00'))
+        self.assertIn(found[0], game_check.WARNINGS)
+
+    def test_unreadable_lbp3_executable(self):
+        self.assertEqual(game_check.problem(self.game('CUSA00063', '01.00', b'junk'))[0], 'unreadable')
+
     def test_every_problem_is_explained(self):
         for kind in ('missing_update', 'wrong_eboot', 'patched_eboot', 'other_title',
-                     'unreadable', 'damaged_files'):
+                     'unreadable', 'damaged_files', 'lbp3_untested'):
             self.assertIn('CUSA', game_check.explain(kind, 'CUSA03173', '01.00'))
 
 

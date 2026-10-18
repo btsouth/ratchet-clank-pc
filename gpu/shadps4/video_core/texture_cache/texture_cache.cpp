@@ -14,6 +14,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -22,6 +23,22 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+namespace {
+/// bbport: the slices of a volume are layers to a 2D (array) view of it. A game rendering a 3D
+/// texture one slice at a time (LBP3's lighting volumes) asks for slice k as a target of k + 1
+/// layers: the volume was freed as "too small" and rebuilt layer by layer every frame.
+SubresourceExtent AvailableResources(const ImageInfo& image, const ImageInfo& requested,
+                                     TextureCache::BindingType binding) {
+    SubresourceExtent available = image.resources;
+    // Render targets only: a sampled 2D array view of a 3D image is not valid Vulkan.
+    if (binding == TextureCache::BindingType::RenderTarget &&
+        image.type == AmdGpu::ImageType::Color3D && requested.type != AmdGpu::ImageType::Color3D) {
+        available.layers = std::max(available.layers, image.size.depth);
+    }
+    return available;
+}
+} // namespace
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -255,10 +272,22 @@ void TextureCache::WatchImage(const Image& image, const char* what) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
-    // bbport: only an image starting at `address` is affected, so the images over its first byte
-    // are all there is to look at (the whole range was walked for every GPU write binding).
-    ForEachImageInRegion(address, 1, [&](ImageId image_id, Image& image) {
+    // The image starting at `address` and every image wholly inside the write (LBP3 clears two
+    // 16 MB light atlases with one 64 MB binding) are reuploaded when accessed again. Writes over
+    // part of an image are not tracked (upstream TODO: subresources). bbport: ranges with no
+    // image inside past their first byte are remembered until images change, so most bindings
+    // only look at the images over their first byte.
+    const u64 generation = registry_generation.load(std::memory_order_relaxed);
+    auto& memo = invalidate_memo[((address >> 6) ^ max_size * 0x9E3779B1u) % invalidate_memo.size()];
+    const bool start_only =
+        memo.address == address && memo.size == max_size && memo.generation == generation;
+    bool inside = false;
+    const VAddr end = address + max_size;
+    ForEachImageInRegion(address, start_only ? 1 : max_size, [&](ImageId image_id, Image& image) {
         static const bool log = std::getenv("BB_IMAGE_SYNC_LOG") != nullptr;
+        const bool at_start = image.info.guest_address == address;
+        const bool whole = image.info.guest_address >= address &&
+                           image.info.guest_address + image.info.guest_size <= end;
         if (log) {
             static std::atomic<u32> printed{0};
             if (printed.fetch_add(1) < 200) {
@@ -266,18 +295,20 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
                             (unsigned long long)address, (unsigned long long)max_size,
                             (unsigned long long)image.info.guest_address, image.info.size.width,
                             image.info.size.height, u32(image.info.pixel_format), u32(image.flags),
-                            image.info.guest_address == address ? "" : " (not at its start: kept)");
+                            at_start || whole ? "" : " (partly written: kept)");
             }
         }
-        // Only consider images that match base address.
-        // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
+        if (!at_start && !whole) {
             return;
         }
+        inside |= !at_start;
         // Ensure image is reuploaded when accessed again.
         WatchImage(image, "GPU write (marked for refresh)");
         image.flags |= ImageFlagBits::GpuDirty;
     });
+    if (!start_only && !inside) {
+        memo = {address, max_size, generation};
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -390,6 +421,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
+        // bbport: the last slice of a volume as a target of depth layers is the volume itself.
+        if (binding == BindingType::RenderTarget &&
+            cache_image.info.type == AmdGpu::ImageType::Color3D &&
+            image_info.type != AmdGpu::ImageType::Color3D &&
+            image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.resources.layers <= cache_image.info.size.depth &&
+            image_info.guest_size <= cache_image.info.guest_size) {
+            return {merged_image_id ? merged_image_id : cache_image_id, -1, -1};
+        }
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
@@ -591,13 +631,38 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    // bbport BB_IMAGE_EXPAND_LOG=1: each image replaced by a larger one (first 64).
+    static const bool expand_log = std::getenv("BB_IMAGE_EXPAND_LOG") != nullptr;
+    if (static int logged = 0; expand_log && logged++ < 64) {
+        const auto& old = slot_images[image_id].info;
+        std::printf("Image expand: %#llx %s %ux%u layers %u->%u levels %u->%u type %d->%d "
+                    "size %llu->%llu\n",
+                    (unsigned long long)info.guest_address, vk::to_string(info.pixel_format).c_str(),
+                    info.size.width, info.size.height, old.resources.layers, info.resources.layers,
+                    old.resources.levels, info.resources.levels, int(old.type), int(info.type),
+                    (unsigned long long)old.guest_size, (unsigned long long)info.guest_size);
+    }
     const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
-    RefreshImage(new_image);
+    // bbport: an image that only gained layers (LBP3 renders 64-slice volumes one slice per pass
+    // into an array that grows by a layer each time) uploads only the new layers; the copy
+    // brings the others. Uploading all of them each time cost 750 MB in one frame (633 ms
+    // between flips on devbox, past the game's 1 s flip watchdog when the machine was busy).
+    const auto& old_info = src_image.info;
+    const bool layers_only =
+        old_info.type == info.type && old_info.pixel_format == info.pixel_format &&
+        old_info.tile_mode == info.tile_mode && old_info.size == info.size &&
+        old_info.pitch == info.pitch && old_info.num_samples == info.num_samples &&
+        old_info.resources.levels == 1 && info.resources.levels == 1 &&
+        info.resources.layers > old_info.resources.layers && !info.props.is_volume &&
+        !old_info.props.is_volume && !info.props.is_block &&
+        old_info.mips_layout[0].pitch == info.mips_layout[0].pitch &&
+        old_info.mips_layout[0].height == info.mips_layout[0].height;
+    RefreshImage(new_image, layers_only ? old_info.resources.layers : 0);
     runtime.CopyImage(&src_image, &new_image);
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
@@ -705,7 +770,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (AvailableResources(image_resolved.info, info, desc.type) < info.resources) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
@@ -863,9 +928,17 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
         ImageId stencil_id{};
+        // Only the stencil placeholder (or a stencil-format image) there: a game may put a color
+        // target where an unused stencil plane would be (LBP3), and an image linked here is
+        // bound as the depth buffer instead (upstream shadPS4 AssociateStencil does the same).
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                 if (image.info.guest_address != desc.info.stencil_addr) {
+                                     return;
+                                 }
+                                 if (image.info.pixel_format == vk::Format::eUndefined ||
+                                     Vulkan::LiverpoolToVK::IsFormatStencilCompatible(
+                                         image.info.pixel_format)) {
                                      stencil_id = image_id;
                                  }
                              });
@@ -885,7 +958,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
-void TextureCache::RefreshImage(Image& image) {
+void TextureCache::RefreshImage(Image& image, u32 first_layer) {
     WatchImage(image, "refresh entered");
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -963,7 +1036,17 @@ void TextureCache::RefreshImage(Image& image) {
             window_start = now;
         }
     }
-    BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    // bbport: the bytes before first_layer's slice in the linear layout (one mip level).
+    const u64 first_byte = first_layer == 0
+                               ? 0
+                               : u64(image.info.mips_layout[0].pitch) *
+                                     image.info.mips_layout[0].height * (image.info.num_bits / 8) *
+                                     first_layer;
+    ASSERT(first_layer == 0 || (num_mips == 1 && !image.info.props.is_volume &&
+                                !image.info.props.is_block && first_layer < num_layers &&
+                                first_byte < image.info.guest_size));
+    BbStats::image_upload_bytes.fetch_add(image.info.guest_size - first_byte,
+                                          std::memory_order_relaxed);
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -985,14 +1068,14 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
         image_copies.push_back({
-            .bufferOffset = mip_offset,
+            .bufferOffset = mip_offset + first_byte,
             .bufferRowLength = mip_pitch,
             .bufferImageHeight = mip_height,
             .imageSubresource{
                 .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
                 .mipLevel = m,
-                .baseArrayLayer = 0,
-                .layerCount = num_layers,
+                .baseArrayLayer = first_layer,
+                .layerCount = num_layers - first_layer,
             },
             .imageOffset = {0, 0, 0},
             .imageExtent = {extent_width, extent_height, depth},
@@ -1009,7 +1092,8 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto [buffer, offset] =
+        tile_manager.DetileImage(in_buffer, in_offset, image.info, first_byte);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }

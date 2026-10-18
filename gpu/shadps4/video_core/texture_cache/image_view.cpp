@@ -128,6 +128,21 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     if (!info.is_storage) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
+    if (image.info.props.is_volume && info.type != AmdGpu::ImageType::Color3D) {
+        // bbport: a 2D (array) view of slices of a volume (2D-array compatible) may only be an
+        // attachment; sampling one needs VK_EXT_image_2d_view_of_3d (one slice, 2D view).
+        auto allowed = vk::ImageUsageFlagBits::eColorAttachment |
+                       vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                       vk::ImageUsageFlagBits::eInputAttachment;
+        if (info.type == AmdGpu::ImageType::Color2D && info.range.extent.layers == 1 &&
+            instance.Is2dViewOf3dSupported()) {
+            allowed |= vk::ImageUsageFlagBits::eSampled;
+            if (info.is_storage) {
+                allowed |= vk::ImageUsageFlagBits::eStorage;
+            }
+        }
+        usage_ci.usage &= allowed;
+    }
     vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
     if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
         const float last_level =

@@ -49,8 +49,10 @@ public:
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
+    /// bbport: first_byte > 0 detiles only from there on (the linear buffer before it is
+    /// undefined): the layers an expanded image added.
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, u64 first_byte = 0);
 
 private:
     void RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
