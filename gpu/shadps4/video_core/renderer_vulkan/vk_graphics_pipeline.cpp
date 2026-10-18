@@ -85,16 +85,32 @@ GraphicsPipeline::GraphicsPipeline(
     job->num_modules = modules.size();
     job->sdata = sdata;
     job->built = deferral->built;
+    job->pipeline_cache = pipeline_cache;
+    deferred = job;
     handle_pending.store(true, std::memory_order_release);
-    deferral->submit([this, pipeline_cache, job] {
-        Build(pipeline_cache, job->runtime_infos,
-              std::span<const vk::ShaderModule>{job->modules.data(), job->num_modules}, job->sdata,
-              false);
-        if (job->built) {
-            job->built(job->sdata);
+    deferral->submit([this, job] {
+        if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+            RunDeferred(*job);
         }
-        PublishHandle();
     });
+}
+
+void GraphicsPipeline::RunDeferred(DeferredBuild& job) {
+    Build(job.pipeline_cache, job.runtime_infos,
+          std::span<const vk::ShaderModule>{job.modules.data(), job.num_modules}, job.sdata, false);
+    if (job.built) {
+        job.built(job.sdata);
+    }
+    PublishHandle();
+}
+
+bool GraphicsPipeline::BuildNow() const {
+    if (!deferred || deferred->claimed.exchange(true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    // The handle is not published yet: no other thread reads what the build writes.
+    const_cast<GraphicsPipeline*>(this)->RunDeferred(*deferred);
+    return true;
 }
 
 void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
@@ -484,7 +500,12 @@ void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
 }
 
 GraphicsPipeline::~GraphicsPipeline() {
-    WaitHandle(); // the worker may still write (or notify on) this object
+    // A build no one started never runs (its job only checks the claim); a started one may
+    // still write (or notify on) this object.
+    if (deferred && !deferred->claimed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    WaitHandle();
 }
 
 template <typename Attribute, typename Binding>

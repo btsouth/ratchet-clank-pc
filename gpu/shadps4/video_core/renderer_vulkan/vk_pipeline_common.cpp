@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -12,6 +13,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+#include "bbport_toggles.h"
 
 namespace Vulkan {
 
@@ -25,6 +28,93 @@ Pipeline::~Pipeline() = default;
 
 std::atomic<u64> g_bb_pipeline_wait_ns;
 std::atomic<u64> g_bb_compile_stall_ns;
+std::atomic<u64> g_bb_pipeline_skipped_draws;
+
+namespace {
+u64 EnvNumber(const char* name, u64 fallback) {
+    const char* env = std::getenv(name);
+    return env && *env ? std::strtoull(env, nullptr, 10) : fallback;
+}
+
+/// The time draws of the current shown frame (BbStats::frame_number) spent waiting for
+/// pipelines, on all recording threads together.
+struct DrawWaitBudget {
+    std::atomic<u32> frame{~0u};
+    std::atomic<u64> used_ns{0};
+
+    u64 Used(u32 shown) {
+        u32 seen = frame.load(std::memory_order_relaxed);
+        if (seen != shown && frame.compare_exchange_strong(seen, shown)) {
+            used_ns.store(0, std::memory_order_relaxed);
+        }
+        return used_ns.load(std::memory_order_relaxed);
+    }
+};
+DrawWaitBudget draw_wait_budget;
+} // namespace
+
+vk::Pipeline Pipeline::HandleForDrawSlow(bool recurring) const {
+    // Geometry of a pass drawn every frame shows a frame later; a one-time render or a
+    // full-screen pass that goes without leaves a hole or a grey frame, so those wait longer.
+    // The longer budget keeps the frame's flip well inside LBP3's watchdog (5 waits of 100 ms
+    // for the previous frame's flip), which a cold cache missed: ~100 pipelines in one frame
+    // at 50-140 ms each on NVIDIA.
+    static const u64 recurring_ns = EnvNumber("BB_PIPELINE_WAIT_MS", 8) * 1'000'000;
+    static const u64 other_ns = EnvNumber("BB_PIPELINE_STALL_MS", 200) * 1'000'000;
+    static const u64 max_frames = EnvNumber("BB_PIPELINE_SKIP_FRAMES", 60);
+    const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+    bool overdue;
+    {
+        std::scoped_lock lk{handle_mutex};
+        if (!handle_pending.load(std::memory_order_acquire)) {
+            return *pipeline;
+        }
+        if (missing_frame != shown) {
+            missing_frame = shown;
+            ++missing_frames;
+        }
+        overdue = missing_frames > max_frames;
+    }
+    if (overdue) {
+        // Missing for too long: drawn now, built here if its job has not started.
+        if (!BuildNow()) {
+            WaitHandle();
+        }
+        return *pipeline;
+    }
+    const u64 budget = recurring ? recurring_ns : other_ns;
+    const u64 used = draw_wait_budget.Used(shown);
+    if (used >= budget) {
+        g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto charge = [&] {
+        const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count());
+        draw_wait_budget.used_ns.fetch_add(ns, std::memory_order_relaxed);
+        g_bb_pipeline_wait_ns += ns;
+        g_bb_compile_stall_ns += ns;
+    };
+    // A draw that waits anyway takes its build if no worker has (it may be queued behind a
+    // hundred others): one compile, which the budget then counts.
+    if (!recurring && BuildNow()) {
+        charge();
+        return *pipeline;
+    }
+    std::unique_lock lk{handle_mutex};
+    const bool ready =
+        handle_cv.wait_for(lk, std::chrono::nanoseconds(budget - used),
+                           [&] { return !handle_pending.load(std::memory_order_acquire); });
+    lk.unlock();
+    charge();
+    if (!ready) {
+        g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    return *pipeline;
+}
 
 void Pipeline::WaitHandle() const {
     const auto start = std::chrono::steady_clock::now();

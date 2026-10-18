@@ -1869,10 +1869,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     };
     const bool skip_draw = SkipDrawFor(vs_info.pgm_hash, ps_info ? ps_info->pgm_hash : 0) ||
                            SkipMotionBlur(ps_info ? ps_info->pgm_hash : 0);
+    const bool recurring = PipelineCache::RecurringDraw(regs, false);
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, bound_pipeline->Handle());
-        if (skip_draw) {
-        } else if (is_indexed) {
+        // A pipeline still being built may leave the draw out (HandleForDraw).
+        const vk::Pipeline handle = skip_draw ? vk::Pipeline{} : bound_pipeline->HandleForDraw(recurring);
+        if (!handle) {
+            return;
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
@@ -2054,9 +2059,12 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                        ps_crumb ? ps_crumb->pgm_hash : 0) ||
                            SkipMotionBlur(ps_crumb ? ps_crumb->pgm_hash : 0);
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, bound_pipeline->Handle());
-        if (skip_draw) {
-        } else if (is_indexed) {
+        const vk::Pipeline handle = skip_draw ? vk::Pipeline{} : bound_pipeline->HandleForDraw(false);
+        if (!handle) {
+            return;
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
                                                 stride);

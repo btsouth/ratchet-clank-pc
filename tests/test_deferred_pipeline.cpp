@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // A pipeline whose driver compile runs on a worker: Handle() waits for it, then returns at once.
+// HandleForDraw() waits at most the shown frame's budget, then leaves the draw out.
+#include <dlfcn.h>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -20,6 +23,7 @@
 
 namespace Vulkan {
 extern std::atomic<u64> g_bb_pipeline_wait_ns;
+extern std::atomic<u64> g_bb_pipeline_skipped_draws;
 }
 
 namespace {
@@ -37,6 +41,13 @@ struct DeferredPipeline : Vulkan::Pipeline {
 
 int main() {
     using namespace std::chrono;
+    setenv("BB_PIPELINE_WAIT_MS", "8", 1);
+    setenv("BB_PIPELINE_STALL_MS", "100", 1);
+    setenv("BB_PIPELINE_SKIP_FRAMES", "3", 1);
+    // The library's shown-frame counter (this file's inline copy is hidden).
+    auto* shown = static_cast<std::atomic<std::uint32_t>*>(
+        dlsym(RTLD_DEFAULT, "_ZN7BbStats12frame_numberE"));
+    assert(shown);
     Vulkan::Instance instance(0, false);
     Vulkan::Scheduler scheduler(instance);
     const std::array pool_sizes{vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 4}};
@@ -63,6 +74,46 @@ int main() {
     assert(steady_clock::now() - again < milliseconds(5));
     std::printf("Deferred pipeline: Handle() waited %.1f ms for the worker, then none\n",
                 duration<double, std::milli>(waited).count());
+
+    // HandleForDraw: a draw waits for a pipeline still being built at most what is left of the
+    // shown frame's budget (8 ms for recurring geometry, 100 ms here for others), then goes
+    // without; the budget renews each shown frame; a pipeline missing in more than 3 shown
+    // frames is waited for.
+    const auto timed = [](auto&& call) {
+        const auto t = steady_clock::now();
+        const vk::Pipeline result = call();
+        return std::pair{result, duration<double, std::milli>(steady_clock::now() - t).count()};
+    };
+    {
+        DeferredPipeline slow(instance, scheduler, heap, profile);
+        shown->fetch_add(1);
+        const u64 skipped = Vulkan::g_bb_pipeline_skipped_draws.load();
+        auto [h1, ms1] = timed([&] { return slow.HandleForDraw(true); });
+        assert(!h1 && ms1 >= 7.0 && ms1 < 60.0);
+        auto [h2, ms2] = timed([&] { return slow.HandleForDraw(true); });
+        assert(!h2 && ms2 < 3.0); // the recurring budget is spent
+        auto [h3, ms3] = timed([&] { return slow.HandleForDraw(false); });
+        assert(!h3 && ms3 >= 80.0 && ms3 < 150.0); // the rest of the 100 ms
+        auto [h4, ms4] = timed([&] { return slow.HandleForDraw(false); });
+        assert(!h4 && ms4 < 3.0);
+        assert(Vulkan::g_bb_pipeline_skipped_draws.load() == skipped + 4);
+        shown->fetch_add(1); // a new frame, a new budget (missing in 2 frames)
+        auto [h5, ms5] = timed([&] { return slow.HandleForDraw(true); });
+        assert(!h5 && ms5 >= 7.0);
+        shown->fetch_add(1);
+        (void)slow.HandleForDraw(true); // 3 frames
+        shown->fetch_add(1);           // 4: overdue, waited for
+        std::thread finisher([&] {
+            std::this_thread::sleep_for(milliseconds(30));
+            slow.Finish();
+        });
+        auto [h6, ms6] = timed([&] { return slow.HandleForDraw(true); });
+        finisher.join();
+        assert(!slow.IsHandlePending() && ms6 >= 25.0);
+        std::printf("HandleForDraw: left out after %.1f / %.1f ms of a frame's budget, waited "
+                    "%.1f ms once missing in 4 frames\n",
+                    ms1, ms3, ms6);
+    }
 
     // A real GraphicsPipeline built through a deferral (vertex stage only, no attachments): the
     // driver compile runs on the worker, Handle() waits for it and gets a pipeline; destroying a
@@ -123,13 +174,24 @@ int main() {
     real_worker.join();
     assert(handle && !real->IsHandlePending() && built.load() == 1);
 
+    // A draw that waits anyway builds the pipeline itself when no worker has started it; the
+    // queued job then does nothing.
+    auto inline_built = make();
+    shown->fetch_add(1);
+    const vk::Pipeline inline_handle = inline_built->HandleForDraw(false);
+    assert(inline_handle && !inline_built->IsHandlePending() && built.load() == 2);
+    run_jobs_later(milliseconds(0)).join();
+    assert(built.load() == 2);
+
+    // Destroying a pipeline whose build has not started returns at once; its job does nothing.
     auto dropped = make();
     assert(dropped->IsHandlePending());
-    std::thread drop_worker = run_jobs_later(milliseconds(30));
     const auto drop_start = steady_clock::now();
-    dropped.reset(); // waits for the worker's build
-    assert(steady_clock::now() - drop_start >= milliseconds(25) && built.load() == 2);
-    drop_worker.join();
+    dropped.reset();
+    assert(steady_clock::now() - drop_start < milliseconds(20));
+    run_jobs_later(milliseconds(0)).join();
+    assert(built.load() == 2);
+    inline_built.reset();
 
     real.reset();
     // Vulkan calls from this executable need their own dispatcher (libbbgpu.so has its own).
@@ -139,7 +201,7 @@ int main() {
     dispatch.init(instance.GetInstance());
     dispatch.init(device);
     device.destroyShaderModule(vs_module, nullptr, dispatch);
-    std::printf("Deferred GraphicsPipeline: built on the worker, bound after it, destroyed "
-                "while pending waited for its build\n");
+    std::printf("Deferred GraphicsPipeline: built on the worker, bound after it; built inline "
+                "by a draw that needed it first; dropped before its build without one\n");
     return 0;
 }

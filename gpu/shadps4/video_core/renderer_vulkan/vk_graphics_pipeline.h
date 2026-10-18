@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -121,6 +122,7 @@ public:
                          u32 step_rate_1, std::span<const AmdGpu::Buffer> sharps = {}) const;
 
 private:
+    bool BuildNow() const override;
     void BuildDescSetLayout(bool preloading);
     void Build(vk::PipelineCache pipeline_cache,
                std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
@@ -133,7 +135,13 @@ private:
         size_t num_modules{};
         SerializationSupport sdata{};
         std::function<void(const SerializationSupport&)> built;
+        vk::PipelineCache pipeline_cache;
+        /// Taken by whoever runs the build: the worker, or a thread that needs it first.
+        std::atomic<bool> claimed{false};
     };
+    /// Runs the deferred build once claimed.
+    void RunDeferred(DeferredBuild& job);
+    std::shared_ptr<DeferredBuild> deferred;
 
 private:
     GraphicsPipelineKey key;
