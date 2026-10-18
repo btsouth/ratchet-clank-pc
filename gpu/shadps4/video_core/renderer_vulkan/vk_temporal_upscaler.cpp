@@ -393,14 +393,21 @@ bool TemporalUpscaler::OnFrameStart() {
     }
     BbSettings::Get().active_render_width = Scaled() ? render_width : scene_targets.Size().width;
     BbSettings::Get().active_render_height = Scaled() ? render_height : scene_targets.Size().height;
-    if (changed || !dispatched_last_frame) reset = true;
+    // A frame may pass the display buffer more than once (Ratchet & Clank: twice): the history
+    // resets when a whole shown frame went by without the upscaler, not at every pass.
+    const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+    const bool new_frame = shown != checked_frame;
+    if (changed || (new_frame && !dispatched_last_frame)) reset = true;
     if (changed) jitter_index = 0;
     applied_preset = preset;
     applied_output = output;
     applied_upscaler = upscaler;
     last_active = active;
     last_jitter = jitter_on;
-    dispatched_last_frame = false;
+    if (new_frame) {
+        dispatched_last_frame = false;
+        checked_frame = shown;
+    }
 
     // Diagnostics BB_UI_TRACE=1: the draws of frames that ended without the output-size UI
     // (their display buffer is shown as the game drew it, at its own size), and of one that had it.

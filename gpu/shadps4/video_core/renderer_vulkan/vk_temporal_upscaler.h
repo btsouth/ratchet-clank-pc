@@ -225,6 +225,7 @@ private:
     int applied_preset = -1;
     int applied_upscaler = -1;
     bool dispatched_last_frame = false;
+    u32 checked_frame = ~0u; ///< BbStats::frame_number at the last history check
     bool last_active = false, last_jitter = false;
 
 
