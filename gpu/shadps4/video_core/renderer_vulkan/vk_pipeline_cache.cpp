@@ -594,6 +594,34 @@ double ProfileSeconds() {
     static const auto start = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
+/// bbport: GPU-thread shader translation per shown frame for graphics draws; past it they are
+/// left out and their shaders translated in the frames after. Recurring geometry
+/// (PipelineCache::RecurringDraw) gets BB_SHADER_WAIT_MS of it, other draws BB_SHADER_FRAME_MS.
+/// A first visit brings hundreds of shaders: a few ms each on a slow CPU kept LBP3's flip from
+/// its watchdog (~1 s of translation in one frame on devbox).
+struct TranslationBudget {
+    u32 frame = ~0u;
+    u64 used_ns = 0;
+    bool Spent(bool recurring) {
+        const auto env_ms = [](const char* name, u64 fallback) {
+            const char* env = std::getenv(name);
+            return (env && *env ? std::strtoull(env, nullptr, 10) : fallback) * 1'000'000;
+        };
+        static const u64 recurring_ns = env_ms("BB_SHADER_WAIT_MS", 16);
+        static const u64 other_ns = env_ms("BB_SHADER_FRAME_MS", 100);
+        const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+        if (shown != frame) {
+            frame = shown;
+            used_ns = 0;
+        }
+        return used_ns >= (recurring ? recurring_ns : other_ns);
+    }
+};
+TranslationBudget translation_budget; ///< GPU thread only
+} // namespace
+std::atomic<u64> g_bb_translation_skipped_draws;
+namespace {
+
 struct CompileTimer {
     const char* what = nullptr; // a pipeline: reported with its hash when profiled or slow
     u64 hash = 0;
@@ -731,7 +759,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     }
     sel.draw_indirect_params = params;
-    if (!RefreshGraphicsKey(sel)) {
+    sel.recurring = RecurringDraw(liverpool->regs, indirect);
+    const bool selected = RefreshGraphicsKey(sel);
+    sel.may_defer_translation = false;
+    if (!selected) {
+        if (sel.translation_deferred) {
+            g_bb_translation_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        }
         return nullptr;
     }
     if (const auto found = graphics_pipelines.find(sel.graphics_key); found != graphics_pipelines.end()) {
@@ -937,11 +971,13 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
             std::printf("GPU: %llu pipelines compiled in the background, %llu draws went without "
                         "theirs meanwhile, %llu waited for one; %llu more built on workers for "
                         "the recorder, which waited %.1f ms for them and recorded %llu draws "
-                        "without theirs\n",
+                        "without theirs; %llu draws left out until their shaders are "
+                        "translated\n",
                         (unsigned long long)async_started, (unsigned long long)async_skipped,
                         (unsigned long long)async_waited, (unsigned long long)deferred_started,
                         double(g_bb_pipeline_wait_ns.exchange(0)) / 1e6,
-                        (unsigned long long)g_bb_pipeline_skipped_draws.exchange(0));
+                        (unsigned long long)g_bb_pipeline_skipped_draws.exchange(0),
+                        (unsigned long long)g_bb_translation_skipped_draws.exchange(0));
             async_started = async_skipped = async_waited = deferred_started = 0;
         }
     }
@@ -1198,6 +1234,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(sel, stage_in, stage_out, params, binding);
+        if (sel.translation_deferred) {
+            return false;
+        }
         if (fetch_shader_) {
             sel.fetch_shader = fetch_shader_;
         }
@@ -1206,8 +1245,15 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
+    // bbport: the GPU thread's selection may leave a draw out instead of translating past the
+    // frame's budget (TranslationBudget).
+    sel.may_defer_translation = !sel.worker;
+    sel.translation_deferred = false;
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    if (sel.translation_deferred) {
+        return false;
+    }
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -1276,6 +1322,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
     }
+    if (sel.translation_deferred) {
+        return false;
+    }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
@@ -1310,6 +1359,15 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const auto budget_start = std::chrono::steady_clock::now();
+    const struct BudgetCharge {
+        std::chrono::steady_clock::time_point start;
+        ~BudgetCharge() {
+            translation_budget.used_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - start)
+                                                  .count());
+        }
+    } budget_charge{budget_start};
     CompileTimer timer;
     const bool shader_profile = ShaderProfile();
     using Clock = std::chrono::steady_clock;
@@ -1440,6 +1498,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
     if (it_pgm == program_cache.end()) {
+        if (sel.may_defer_translation && translation_budget.Spent(sel.recurring)) {
+            sel.translation_deferred = true;
+            return {};
+        }
         auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto start = binding;
         const auto module =
@@ -1485,6 +1547,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         program->last_used = std::distance(program->modules.begin(), it);
     }
     if (it == program->modules.end()) {
+        if (sel.may_defer_translation && translation_budget.Spent(sel.recurring)) {
+            sel.translation_deferred = true;
+            return {};
+        }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 

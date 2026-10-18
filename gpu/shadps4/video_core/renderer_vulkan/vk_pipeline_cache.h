@@ -99,6 +99,11 @@ struct PipelineSelection {
     bool motion = false;
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
+    /// bbport: graphics stages on the GPU thread may leave a shader untranslated once the shown
+    /// frame's translation budget is spent (`translation_deferred` then set, the draw left out).
+    bool may_defer_translation = false;
+    bool translation_deferred = false;
+    bool recurring = false; ///< PipelineCache::RecurringDraw, for the translation budget
 };
 
 /// bbport: a draw-preparation worker's own program state (see vk_draw_prep.h).
