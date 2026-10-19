@@ -574,7 +574,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // game the port knows nothing about.
     const char* hooks_env = std::getenv("BB_GUEST_HOOKS");
     const Game::Profile* game = Game::Active();
-    if (GuestInPlace() && game && game->install_hooks && !(hooks_env && hooks_env[0] == '0')) {
+    if ((GuestInPlace() || (game && game->hooks_any_memory_model)) && game &&
+        game->install_hooks && !(hooks_env && hooks_env[0] == '0')) {
         static BufferCache* hooked_cache = this;
         game->install_hooks(Game::CoreServices{
             .fresh_range = [](u64 address, u64 size) { hooked_cache->NoteFreshRange(address, size); },

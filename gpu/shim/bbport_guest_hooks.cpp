@@ -60,36 +60,13 @@ constexpr std::array<CallSite, 2> MemcpySites = {{
 }};
 std::array<std::atomic<u64>, MemcpySites.size()> hits{};
 
-/// The game's GPU data writer jobs: two parallel-for loops (0x1792a10, and the one around
-/// 0x1789179) call 0x1792b00 per work item (rdi the item, rsi, rdx, rcx). It fills the frame's
-/// 22 MiB ring segment (0x1101000000-0x1103ffffff) while the draws that read it are already
-/// submitted (the PS4's GPU reaches them later). BB_WRITER_HOOK=1 (default with async write
-/// tracking): the calls go through WriterJob, which counts running items and stamps their end
-/// (BbStats::writers_active, writers_end_tsc) for MemoryTracker::SyncAsyncWrites.
-constexpr u64 WriterEntry = 0x1792b00;
-constexpr std::array<CallSite, 2> WriterSites = {{
-    {0x1792aa3, {0xe8, 0x58, 0x00, 0x00, 0x00}},
-    {0x1789179, {0xe8, 0x82, 0x99, 0x00, 0x00}},
-}};
-using WriterFn = void (*)(u64, u64, u64, u64);
-void WriterJob(u64 item, u64 b, u64 c, u64 d) {
-    BbStats::writers_active.fetch_add(1, std::memory_order_seq_cst);
-    reinterpret_cast<WriterFn>(ImageBase + WriterEntry)(item, b, c, d);
-    BbStats::writers_end_tsc.store(__builtin_ia32_rdtsc(), std::memory_order_seq_cst);
-    BbStats::writers_active.fetch_sub(1, std::memory_order_seq_cst);
-    BbStats::writer_items.fetch_add(1, std::memory_order_relaxed);
-}
-bool WriterHook() {
-    static const bool on = [] {
-        const char* env = std::getenv("BB_WRITER_HOOK");
-        if (env) {
-            return env[0] == '1';
-        }
-        const char* async = std::getenv("BB_ASYNC_WP");
-        return !(async && async[0] == '0');
-    }();
-    return on;
-}
+/// Call sites redirected by HookCall (other games' profiles): offset and new target.
+struct CallHook {
+    u64 offset;
+    const void* target;
+};
+std::array<CallHook, 8> call_hooks{};
+std::atomic<std::size_t> num_call_hooks{0};
 
 /// The game's memcpy at those sites: the GPU side is told before (its write traps lift: no fault
 /// per page) and after the copy (the data now there), as for file reads.
@@ -357,14 +334,13 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
         g[REG_RIP] = greg_t(reinterpret_cast<u64>(&LoaderCopy));
         return;
     }
-    for (const auto& site : WriterSites) {
-        if (rip != ImageBase + site.offset) {
+    for (std::size_t i = 0; i < num_call_hooks.load(std::memory_order_acquire); ++i) {
+        if (rip != ImageBase + call_hooks[i].offset) {
             continue;
         }
-        const u64 ret = ImageBase + site.offset + 5;
-        g[REG_RSP] -= 8;
-        *reinterpret_cast<u64*>(g[REG_RSP]) = ret;
-        g[REG_RIP] = greg_t(reinterpret_cast<u64>(&WriterJob));
+        g[REG_RSP] -= 8; // the call: push the return address, jump to the new target
+        *reinterpret_cast<u64*>(g[REG_RSP]) = ImageBase + call_hooks[i].offset + 5;
+        g[REG_RIP] = greg_t(reinterpret_cast<u64>(call_hooks[i].target));
         return;
     }
     if (previous_action.sa_flags & SA_SIGINFO) {
@@ -401,7 +377,8 @@ bool Patch(u64 address, const unsigned char* expected, std::size_t size) {
 }
 } // namespace
 
-void Install(RangeCallback on_gpu_range_allocated) {
+namespace {
+void InstallTrapHandler() {
     static std::atomic<bool> installed{false};
     if (installed.exchange(true)) {
         return;
@@ -411,20 +388,42 @@ void Install(RangeCallback on_gpu_range_allocated) {
     action.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTRAP, &action, &previous_action);
+}
+} // namespace
+
+bool HookCall(std::uint64_t offset, const unsigned char (&code)[5], const void* target) {
+    InstallTrapHandler();
+    const std::size_t n = num_call_hooks.load(std::memory_order_relaxed);
+    if (n == call_hooks.size()) {
+        return false;
+    }
+    call_hooks[n] = {offset, target};
+    num_call_hooks.store(n + 1, std::memory_order_release);
+    if (!Patch(ImageBase + offset, code, sizeof(code))) {
+        return false; // another build of the game: left alone
+    }
+    if (!stub_page && !(stub_page = MapStubPage())) {
+        return true; // stays an int3 trap
+    }
+    mprotect(stub_page, StubPageSize, PROT_READ | PROT_WRITE | PROT_EXEC);
+    const bool detour = InstallCallDetour(offset, target);
+    mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
+    (void)detour; // false: stays an int3 trap
+    return true;
+}
+
+void Install(RangeCallback on_gpu_range_allocated) {
+    static std::atomic<bool> installed{false};
+    if (installed.exchange(true)) {
+        return;
+    }
+    InstallTrapHandler();
     int patched = 0;
     for (const auto& site : MemcpySites) {
         patched += Patch(ImageBase + site.offset, site.code, sizeof(site.code));
     }
     std::printf("Guest hooks: %d of %zu resource copy sites tell the GPU side of their writes\n",
                 patched, MemcpySites.size());
-    int writers = 0;
-    for (const auto& site : WriterSites) {
-        if (WriterHook()) {
-            writers += Patch(ImageBase + site.offset, site.code, sizeof(site.code));
-        }
-    }
-    std::printf("Guest hooks: %d of %zu GPU data writer job sites counted (BB_WRITER_HOOK)\n",
-                writers, WriterSites.size());
     on_range_allocated = on_gpu_range_allocated;
     const bool allocator = Patch(ImageBase + AllocReturn, AllocReturnCode, sizeof(AllocReturnCode));
     // BB_HEAP_HOOKS=0 (bisecting): the heap's ranges are not reported.
@@ -450,12 +449,6 @@ void Install(RangeCallback on_gpu_range_allocated) {
         for (const auto& site : MemcpySites) {
             if (reinterpret_cast<const u8*>(ImageBase + site.offset)[0] == 0xcc) {
                 detours += InstallCallDetour(site.offset);
-            }
-        }
-        for (const auto& site : WriterSites) {
-            if (reinterpret_cast<const u8*>(ImageBase + site.offset)[0] == 0xcc) {
-                detours += InstallCallDetour(site.offset,
-                                             reinterpret_cast<const void*>(&WriterJob));
             }
         }
         for (auto& site : native_sites) {

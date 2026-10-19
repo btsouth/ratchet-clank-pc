@@ -14,4 +14,8 @@ using RangeCallback = void (*)(std::uint64_t address, std::uint64_t size);
 
 /// Installs the hooks once (GPU side, after the game is loaded).
 void Install(RangeCallback on_gpu_range_allocated);
+
+/// Redirects the `call rel32` at image offset `offset` (its 5 bytes must be `code`) to `target`,
+/// a function with the callee's arguments. False: the bytes differ (another build) or no slot.
+bool HookCall(std::uint64_t offset, const unsigned char (&code)[5], const void* target);
 } // namespace BbGuestHooks
