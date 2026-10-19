@@ -121,6 +121,13 @@ inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
 /// Rescans for the time window that found late writes (their region is rescanned for
 /// BB_ASYNC_REC_LATE_MS).
 inline std::atomic<std::uint64_t> async_late_regions{0};
+/// The game's GPU data writer jobs (BbGuestHooks::WriterJob): items running now, TSC of the last
+/// one's end, items done; the draw recording thread's waits for them (count, TSC ticks), and its
+/// bindings of written regions while items ran.
+inline std::atomic<std::int64_t> writers_active{0};
+inline std::atomic<std::uint64_t> writers_end_tsc{0}, writer_items{0};
+inline std::atomic<std::uint64_t> writer_waits{0}, writer_wait_ticks{0}, writer_overlaps{0},
+    writer_rescans{0};
 /// Waits for the guest that start an upload epoch: MEM_SEMAPHORE, REWIND; met when decoded or waited.
 inline std::atomic<std::uint64_t> guest_releases[2][2]{};
 /// Region scans by the head scanner (MemoryTracker::AsyncHeadScanner).

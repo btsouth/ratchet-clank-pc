@@ -19,6 +19,7 @@
 #include <time.h>
 #include <vector>
 #include <x86intrin.h>
+#include <immintrin.h>
 #include "common/thread.h"
 
 #include "bbport_toggles.h"
@@ -86,10 +87,48 @@ public:
             return now - std::min(now, manager->AsyncWriteTsc()) >= active &&
                    now - std::min(now, manager->AsyncLateTsc()) >= late;
         };
+        // The game's GPU data writer jobs fill memory that draws already submitted read
+        // (BbGuestHooks::WriterJob): a region the guest is writing is rescanned once a job item
+        // ended after its last scan, and the draw recording thread first waits for running items
+        // (at most BB_WRITER_WAIT_US, 2000; 0: no wait).
+        u64 writer_end = 0;
+        if (recorder) {
+            bool writing = false;
+            const u64 last = (query_cpu_addr + query_size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+            for (u64 index = query_cpu_addr >> TRACKER_HIGHER_PAGE_BITS; index <= last; ++index) {
+                if (auto* manager = top_tier[index]; manager && !quiet(manager)) {
+                    writing = true;
+                    break;
+                }
+            }
+            if (writing && BbStats::writers_active.load(std::memory_order_seq_cst) > 0) {
+                BbStats::writer_overlaps.fetch_add(1, std::memory_order_relaxed);
+                if (const u64 wait = WriterWaitTicks()) {
+                    const u64 t0 = __rdtsc();
+                    while (BbStats::writers_active.load(std::memory_order_seq_cst) > 0 &&
+                           __rdtsc() - t0 < wait) {
+                        _mm_pause();
+                    }
+                    BbStats::writer_waits.fetch_add(1, std::memory_order_relaxed);
+                    BbStats::writer_wait_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+                }
+            }
+            if (writing) {
+                writer_end = BbStats::writers_end_tsc.load(std::memory_order_seq_cst);
+            }
+        }
         const auto fresh = [&](RegionManager* manager) {
-            return manager->AsyncFresh(required) &&
-                   (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window ||
-                    quiet(manager));
+            if (!manager->AsyncFresh(required)) {
+                return false;
+            }
+            if (!recorder) {
+                return true;
+            }
+            const bool is_quiet = quiet(manager);
+            if (!is_quiet && manager->AsyncScanTsc() < writer_end) {
+                return false;
+            }
+            return now - std::min(now, manager->AsyncScanTsc()) < window || is_quiet;
         };
         // Adjacent regions to scan go in one ioctl (a binding of Ratchet & Clank's 21 MiB
         // per-frame ranges spans six), their locks taken in address order as the scanner does.
@@ -206,6 +245,14 @@ public:
         const char* env = std::getenv(name);
         const double ms = env ? std::strtod(env, nullptr) : fallback;
         return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
+    }
+    static u64 WriterWaitTicks() {
+        static const u64 ticks = [] {
+            const char* env = std::getenv("BB_WRITER_WAIT_US");
+            const double us = env ? std::strtod(env, nullptr) : 2000.0;
+            return us > 0 ? u64(us * double(BbStats::async_tsc_per_ms.load()) / 1000.0) : 0ull;
+        }();
+        return ticks;
     }
     /// Late writes get page protection where the binding that reads them is at most this big
     /// (BB_ASYNC_LATE_KB, 4096): constants. Rings of tens of MiB bound whole are written ahead

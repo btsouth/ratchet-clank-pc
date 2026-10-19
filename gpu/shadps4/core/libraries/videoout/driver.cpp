@@ -652,7 +652,8 @@ void VideoOutDriver::Flip(const Request& req) {
                             "%.0f/s by the draw recording thread, %.0f/s of them for its time window, %.0f/s finding late writes, %.0f/s for age), %.1f epochs/frame, %.3f ms/frame scanning, "
                             "%.0f written pages/s, %llu failed scans, %llu entry scans (%llu pages), "
                             "%llu late pages page-protected, %.0f head scans/s; releases/s: semaphore %.0f+%.0f "
-                            "waited, rewind %.0f+%.0f waited\n",
+                            "waited, rewind %.0f+%.0f waited; writer items %.0f/s, recorder bindings during them "
+                            "%.0f/s, waits %.0f/s %.2f ms/s\n",
                             scans / window,
                             double(BbStats::async_inline_scans.exchange(0)) / window,
                             double(BbStats::async_recorder_scans.exchange(0)) / window,
@@ -671,7 +672,12 @@ void VideoOutDriver::Flip(const Request& req) {
                             double(BbStats::guest_releases[0][0].exchange(0)) / window,
                             double(BbStats::guest_releases[0][1].exchange(0)) / window,
                             double(BbStats::guest_releases[1][0].exchange(0)) / window,
-                            double(BbStats::guest_releases[1][1].exchange(0)) / window);
+                            double(BbStats::guest_releases[1][1].exchange(0)) / window,
+                            double(BbStats::writer_items.exchange(0)) / window,
+                            double(BbStats::writer_overlaps.exchange(0)) / window,
+                            double(BbStats::writer_waits.exchange(0)) / window,
+                            double(BbStats::writer_wait_ticks.exchange(0)) /
+                                double(BbStats::async_tsc_per_ms.load()) / window);
                 last_epoch = epoch;
             }
             if (const u64 checks = BbStats::stale_checks.exchange(0)) {

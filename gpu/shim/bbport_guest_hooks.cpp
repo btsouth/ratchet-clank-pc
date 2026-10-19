@@ -60,6 +60,37 @@ constexpr std::array<CallSite, 2> MemcpySites = {{
 }};
 std::array<std::atomic<u64>, MemcpySites.size()> hits{};
 
+/// The game's GPU data writer jobs: two parallel-for loops (0x1792a10, and the one around
+/// 0x1789179) call 0x1792b00 per work item (rdi the item, rsi, rdx, rcx). It fills the frame's
+/// 22 MiB ring segment (0x1101000000-0x1103ffffff) while the draws that read it are already
+/// submitted (the PS4's GPU reaches them later). BB_WRITER_HOOK=1 (default with async write
+/// tracking): the calls go through WriterJob, which counts running items and stamps their end
+/// (BbStats::writers_active, writers_end_tsc) for MemoryTracker::SyncAsyncWrites.
+constexpr u64 WriterEntry = 0x1792b00;
+constexpr std::array<CallSite, 2> WriterSites = {{
+    {0x1792aa3, {0xe8, 0x58, 0x00, 0x00, 0x00}},
+    {0x1789179, {0xe8, 0x82, 0x99, 0x00, 0x00}},
+}};
+using WriterFn = void (*)(u64, u64, u64, u64);
+void WriterJob(u64 item, u64 b, u64 c, u64 d) {
+    BbStats::writers_active.fetch_add(1, std::memory_order_seq_cst);
+    reinterpret_cast<WriterFn>(ImageBase + WriterEntry)(item, b, c, d);
+    BbStats::writers_end_tsc.store(__builtin_ia32_rdtsc(), std::memory_order_seq_cst);
+    BbStats::writers_active.fetch_sub(1, std::memory_order_seq_cst);
+    BbStats::writer_items.fetch_add(1, std::memory_order_relaxed);
+}
+bool WriterHook() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_WRITER_HOOK");
+        if (env) {
+            return env[0] == '1';
+        }
+        const char* async = std::getenv("BB_ASYNC_WP");
+        return !(async && async[0] == '0');
+    }();
+    return on;
+}
+
 /// The game's memcpy at those sites: the GPU side is told before (its write traps lift: no fault
 /// per page) and after the copy (the data now there), as for file reads.
 void* LoaderCopy(void* dst, const void* src, std::size_t size) {
@@ -236,11 +267,11 @@ bool InstallDetour(NativeSite& site) {
     return true;
 }
 
-/// The copy call sites: the call's target becomes a trampoline to LoaderCopy.
-bool InstallCallDetour(u64 offset) {
+/// The copy call sites: the call's target becomes a trampoline to LoaderCopy (or `target`).
+bool InstallCallDetour(u64 offset, const void* target = reinterpret_cast<const void*>(&LoaderCopy)) {
     Emitter e;
     e.Bytes({0xff, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp [rip]
-    e.U64(reinterpret_cast<u64>(&LoaderCopy));
+    e.U64(reinterpret_cast<u64>(target));
     const u64 stub = PlaceStub(e);
     const u64 address = ImageBase + offset;
     std::uint32_t rel = 0;
@@ -326,6 +357,16 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
         g[REG_RIP] = greg_t(reinterpret_cast<u64>(&LoaderCopy));
         return;
     }
+    for (const auto& site : WriterSites) {
+        if (rip != ImageBase + site.offset) {
+            continue;
+        }
+        const u64 ret = ImageBase + site.offset + 5;
+        g[REG_RSP] -= 8;
+        *reinterpret_cast<u64*>(g[REG_RSP]) = ret;
+        g[REG_RIP] = greg_t(reinterpret_cast<u64>(&WriterJob));
+        return;
+    }
     if (previous_action.sa_flags & SA_SIGINFO) {
         if (previous_action.sa_sigaction) {
             previous_action.sa_sigaction(sig, info, context);
@@ -376,6 +417,14 @@ void Install(RangeCallback on_gpu_range_allocated) {
     }
     std::printf("Guest hooks: %d of %zu resource copy sites tell the GPU side of their writes\n",
                 patched, MemcpySites.size());
+    int writers = 0;
+    for (const auto& site : WriterSites) {
+        if (WriterHook()) {
+            writers += Patch(ImageBase + site.offset, site.code, sizeof(site.code));
+        }
+    }
+    std::printf("Guest hooks: %d of %zu GPU data writer job sites counted (BB_WRITER_HOOK)\n",
+                writers, WriterSites.size());
     on_range_allocated = on_gpu_range_allocated;
     const bool allocator = Patch(ImageBase + AllocReturn, AllocReturnCode, sizeof(AllocReturnCode));
     // BB_HEAP_HOOKS=0 (bisecting): the heap's ranges are not reported.
@@ -401,6 +450,12 @@ void Install(RangeCallback on_gpu_range_allocated) {
         for (const auto& site : MemcpySites) {
             if (reinterpret_cast<const u8*>(ImageBase + site.offset)[0] == 0xcc) {
                 detours += InstallCallDetour(site.offset);
+            }
+        }
+        for (const auto& site : WriterSites) {
+            if (reinterpret_cast<const u8*>(ImageBase + site.offset)[0] == 0xcc) {
+                detours += InstallCallDetour(site.offset,
+                                             reinterpret_cast<const void*>(&WriterJob));
             }
         }
         for (auto& site : native_sites) {
