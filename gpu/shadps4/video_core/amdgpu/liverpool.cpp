@@ -2777,6 +2777,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     // the GPU thread needs to pick up work.
     auto* draw_prep = rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
     auto prep_submission = draw_prep ? draw_prep->Build(dcb) : nullptr;
+    // Before the GPU thread can see the submission: its packets must carry an epoch after the
+    // guest's writes for it (an older one would take an earlier scan as fresh).
+    NoteGuestSubmit();
     {
         // Numbering, enqueueing and queueing under one lock keep the three orders identical.
         std::scoped_lock lock{queue.m_access};
@@ -2789,7 +2792,6 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         auto task = ProcessGraphics(dcb, ccb, seq, std::move(copy));
         queue.submits.emplace(task.handle);
     }
-    NoteGuestSubmit();
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
@@ -2864,11 +2866,11 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
+    NoteGuestSubmit(); // before the queue sees it, as in SubmitGfx
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
     }
-    NoteGuestSubmit();
 
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
