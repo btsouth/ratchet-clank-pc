@@ -666,6 +666,39 @@ void VideoOutDriver::Flip(const Request& req) {
                             static_cast<unsigned long long>(BbStats::async_entry_pages.exchange(0)));
                 last_epoch = epoch;
             }
+            if (const u64 checks = BbStats::stale_checks.exchange(0)) {
+                u64 p[3][2];
+                for (int k = 0; k < 3; ++k) {
+                    for (int r = 0; r < 2; ++r) {
+                        p[k][r] = BbStats::stale_pages[k][r].exchange(0);
+                    }
+                }
+                std::printf("Stale verify: %.0f checks/s, %.0f clean pages sampled/s; stale pages/s "
+                            "(recorder/others): late %.1f/%.1f, lost scanned %.1f/%.1f, lost "
+                            "protected %.1f/%.1f;",
+                            double(checks) / window,
+                            double(BbStats::stale_sampled.exchange(0)) / window,
+                            p[0][1] / window, p[0][0] / window, p[1][1] / window,
+                            p[1][0] / window, p[2][1] / window, p[2][0] / window);
+                std::scoped_lock lk{BbStats::stale_mutex};
+                std::vector<BbStats::StaleRegion> top;
+                for (auto& e : BbStats::stale_table) {
+                    if (e.pages[0] + e.pages[1] + e.pages[2]) {
+                        top.push_back(e);
+                    }
+                    e = {};
+                }
+                std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+                    return a.pages[0] + a.pages[1] + a.pages[2] > b.pages[0] + b.pages[1] + b.pages[2];
+                });
+                top.resize(std::min<size_t>(top.size(), 10));
+                for (const auto& t : top) {
+                    std::printf(" %#llx:%llu/%llu/%llu", (unsigned long long)t.region,
+                                (unsigned long long)t.pages[0], (unsigned long long)t.pages[1],
+                                (unsigned long long)t.pages[2]);
+                }
+                std::printf("\n");
+            }
             if (const u64 notes = BbStats::cpu_write_notes.exchange(0)) {
                 std::printf("Write notices: %.0f/s, %.2f MB/s (libc copies over pages the GPU side "
                             "watches)\n",

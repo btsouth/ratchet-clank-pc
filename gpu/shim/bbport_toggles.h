@@ -3,6 +3,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <csetjmp>
 #include <chrono>
 #include <cstdint>
@@ -120,6 +121,31 @@ inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
 /// Rescans for the time window that found late writes (their region is rescanned for
 /// BB_ASYNC_REC_LATE_MS).
 inline std::atomic<std::uint64_t> async_late_regions{0};
+/// Diagnostics (BB_STALE_VERIFY=1, MemoryTracker::VerifyStale): sampled pages of bindings that
+/// count as clean but whose bytes changed since their last upload, by kind (0: left to scans and
+/// written since the last scan, a late write; 1: left to scans, the kernel saw no write; 2:
+/// page-protected, no fault came) and thread (0: others, 1: the draw recording thread).
+inline std::atomic<std::uint64_t> stale_checks{0}, stale_sampled{0};
+inline std::atomic<std::uint64_t> stale_pages[3][2]{};
+struct StaleRegion {
+    std::uint64_t region, pages[3];
+};
+inline std::mutex stale_mutex;
+inline StaleRegion stale_table[128];
+inline void NoteStale(std::uint64_t region, int kind) {
+    std::scoped_lock lk{stale_mutex};
+    StaleRegion* slot = &stale_table[(region >> 22) % 128];
+    for (auto& e : stale_table) {
+        if (e.region == region) {
+            slot = &e;
+            break;
+        }
+    }
+    if (slot->region != region) {
+        *slot = {region, {}};
+    }
+    ++slot->pages[kind];
+}
 /// Writes the GPU side heard of from the writers (libc copies over watched pages, no write tracking).
 inline std::atomic<std::uint64_t> cpu_write_notes{0}, cpu_write_note_bytes{0};
 /// Ranges the game's GPU memory allocator handed out (guest hook, BB_GUEST_IN_PLACE).

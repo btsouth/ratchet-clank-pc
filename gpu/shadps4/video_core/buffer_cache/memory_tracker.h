@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <thread>
 #include <time.h>
 #include <vector>
@@ -217,9 +218,84 @@ public:
         });
     }
 
+    /// Diagnostics (BB_STALE_VERIFY=1): uploaded pages get a hash of their bytes. A binding
+    /// samples up to 64 of its pages: one neither CPU- nor GPU-modified (no upload due) whose
+    /// bytes differ from its last upload is stale (BbStats::stale_pages has the kinds).
+    static bool StaleVerify() {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_STALE_VERIFY");
+            return env && env[0] == '1';
+        }();
+        return on;
+    }
+    static u64 PageHash(VAddr page) {
+        const auto* p = reinterpret_cast<const u64*>(page);
+        u64 h = 0x9E3779B97F4A7C15ull;
+        for (size_t i = 0; i < 4096 / 8; ++i) {
+            h = (h ^ p[i]) * 0xff51afd7ed558ccdull;
+            h ^= h >> 29;
+        }
+        return h;
+    }
+    void NoteUploaded(VAddr addr, u64 size) {
+        std::scoped_lock lk{hash_mutex};
+        for (VAddr page = addr & ~VAddr(4095); page < addr + size; page += 4096) {
+            page_hashes[page] = PageHash(page);
+        }
+    }
+    void ForgetUploaded(VAddr addr, u64 size) {
+        std::scoped_lock lk{hash_mutex};
+        for (VAddr page = addr & ~VAddr(4095); page < addr + size; page += 4096) {
+            page_hashes.erase(page);
+        }
+    }
+    void VerifyStale(VAddr addr, u64 size) {
+        if (!StaleVerify() || size == 0) {
+            return;
+        }
+        BbStats::stale_checks.fetch_add(1, std::memory_order_relaxed);
+        const VAddr from = addr & ~VAddr(4095);
+        const u64 pages = (addr + size - from + 4095) / 4096;
+        const u64 stride = std::max<u64>(1, pages / 64);
+        static std::atomic<u64> rotate{0};
+        const u64 start = stride > 1 ? rotate.fetch_add(1, std::memory_order_relaxed) % stride : 0;
+        const int rec = BbStats::async_required_epoch != 0;
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        for (u64 i = start; i < pages; i += stride) {
+            const VAddr page = from + i * 4096;
+            auto* manager = top_tier[page >> TRACKER_HIGHER_PAGE_BITS];
+            if (!manager) {
+                continue;
+            }
+            std::scoped_lock rlk{manager->lock};
+            const u64 offset = page - manager->GetCpuAddr();
+            if (manager->template IsRegionModified<Type::CPU>(offset, 4096) ||
+                manager->template IsRegionModified<Type::GPU>(offset, 4096)) {
+                continue;
+            }
+            BbStats::stale_sampled.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lk{hash_mutex};
+                const auto it = page_hashes.find(page);
+                if (it == page_hashes.end() || it->second == PageHash(page)) {
+                    continue;
+                }
+            }
+            int kind = 2;
+            if (tracker->AsyncWrites() &&
+                manager->AsyncPage(offset / TRACKER_BYTES_PER_PAGE)) {
+                runs.clear();
+                kind = tracker->PeekWritten(page, 4096, runs) && !runs.empty() ? 0 : 1;
+            }
+            BbStats::stale_pages[kind][rec].fetch_add(1, std::memory_order_relaxed);
+            BbStats::NoteStale(page & ~VAddr(TRACKER_HIGHER_PAGE_SIZE - 1), kind);
+        }
+    }
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         SyncAsyncWrites(query_cpu_addr, query_size);
+        VerifyStale(query_cpu_addr, query_size);
         if (!BbToggle::Disabled(BbToggle::LockFreeUploadCheck) &&
             !MaybeCpuModified(query_cpu_addr, query_size)) {
             return false;
@@ -322,6 +398,13 @@ public:
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         SyncAsyncWrites(query_cpu_range, query_size);
+        VerifyStale(query_cpu_range, query_size);
+        const auto noted = [this, &func](u64 addr, u64 size) {
+            if (StaleVerify()) {
+                NoteUploaded(addr, size);
+            }
+            func(addr, size);
+        };
         // bbport: a write binding over pages the CPU did not change and the GPU already owns
         // needs neither an upload nor a state change (it ran under the region lock for every
         // GPU write binding, twice per page). Racing guest writes are as in the read path.
@@ -351,8 +434,8 @@ public:
         const bool gpu_first = is_written && tracker->AsyncWrites() &&
                                EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
         IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written, gpu_first](RegionManager* manager, u64 offset,
-                                                          size_t size) {
+                           [&noted, is_written, gpu_first](RegionManager* manager, u64 offset,
+                                                           size_t size) {
                                // bbport: read-only bindings skip the region lock when no page
                                // in range is CPU-modified. A guest write sets its bit in the
                                // fault handler before the store, and the draw that uses the
@@ -368,7 +451,7 @@ public:
                                        manager->GetCpuAddr() + offset, size);
                                }
                                manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
+                                   manager->GetCpuAddr() + offset, size, noted);
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
@@ -391,10 +474,16 @@ public:
     template <bool clear>
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, auto&& func) {
         IteratePages<false>(query_cpu_range, query_size,
-                            [&func](RegionManager* manager, u64 offset, size_t size) {
+                            [this, &func](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
                                 manager->template ForEachModifiedRange<Type::GPU, clear>(
-                                    manager->GetCpuAddr() + offset, size, func);
+                                    manager->GetCpuAddr() + offset, size,
+                                    [this, &func](u64 addr, u64 size) {
+                                        if (StaleVerify()) {
+                                            ForgetUploaded(addr, size); // the GPU's bytes land
+                                        }
+                                        func(addr, size);
+                                    });
                             });
     }
 
@@ -614,6 +703,8 @@ private:
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
     RegionSummary<NUM_HIGH_PAGES> cpu_summary;
     std::mutex async_mutex;
+    std::mutex hash_mutex;
+    std::unordered_map<VAddr, u64> page_hashes;
     std::vector<RegionManager*> async_regions;
     std::atomic<bool> async_regions_changed{false};
     std::jthread async_scanner; ///< last: stopped and joined before the members it reads go

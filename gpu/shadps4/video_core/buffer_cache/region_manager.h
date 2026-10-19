@@ -283,6 +283,10 @@ public:
     [[nodiscard]] bool AsyncFresh(u64 epoch) const noexcept {
         return scan_epoch.load(std::memory_order_acquire) >= epoch;
     }
+    /// Diagnostics: whether the page is left to scans (no CPU modification, no page protection).
+    [[nodiscard]] bool AsyncPage(size_t page) const noexcept {
+        return async_covered && !writeable.Get(page) && !sync.Get(page);
+    }
     /// TSC of the last scan.
     [[nodiscard]] u64 AsyncScanTsc() const noexcept {
         return scan_tsc.load(std::memory_order_relaxed);

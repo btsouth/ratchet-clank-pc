@@ -893,13 +893,14 @@ struct PageManager::AsyncWp {
                                     boost::icl::interval<VAddr>::right_open(address, address + size));
     }
 
-    bool Scan(VAddr address, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs) const {
+    bool Scan(VAddr address, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs,
+              bool peek = false) const {
         std::array<page_region, 64> regions;
         pm_scan_arg arg{};
         arg.size = sizeof(arg);
         // A range that is not registered any more fails the scan (the caller counts it all as
         // written) instead of being skipped.
-        arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+        arg.flags = peek ? PM_SCAN_CHECK_WPASYNC : (PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC);
         arg.end = address + size;
         arg.vec = reinterpret_cast<u64>(regions.data());
         arg.vec_len = regions.size();
@@ -1000,6 +1001,15 @@ bool PageManager::ScanWritten(VAddr addr, u64 size,
                               std::vector<std::pair<VAddr, VAddr>>& runs) const {
 #ifdef __linux__
     return async && async->Scan(addr, size, runs);
+#else
+    return false;
+#endif
+}
+
+bool PageManager::PeekWritten(VAddr addr, u64 size,
+                              std::vector<std::pair<VAddr, VAddr>>& runs) const {
+#ifdef __linux__
+    return async && async->Scan(addr, size, runs, true);
 #else
     return false;
 #endif
