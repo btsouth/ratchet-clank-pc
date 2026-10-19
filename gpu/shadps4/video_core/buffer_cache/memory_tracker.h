@@ -56,8 +56,8 @@ public:
     /// WaitRegMem; what the guest wrote before it lets the GPU go on; the draw recording thread's
     /// packets carry the epoch they were decoded in). The scanner thread scans the regions in use
     /// as soon as the epoch changes, and every BB_ASYNC_WP_US besides; the caller scans the ones
-    /// it did not get to yet. The draw recording thread also rescans regions not scanned within
-    /// BB_ASYNC_REC_US.
+    /// it did not get to yet. The draw recording thread also rescans regions the guest is
+    /// writing that were not scanned within BB_ASYNC_REC_US.
     void SyncAsyncWrites(VAddr query_cpu_addr, u64 query_size, bool keep_scanned = true) {
         if (!tracker->AsyncWrites() || query_size == 0) {
             return;
@@ -66,14 +66,18 @@ public:
         const u64 required = BbStats::async_required_epoch ? BbStats::async_required_epoch : epoch;
         // The draw recording thread runs behind the guest: a packet may read bytes the guest
         // wrote after it was decoded with no submission or wait between (data it updates late,
-        // after the submission that reads it: a write fault saw it at the binding). Its regions
-        // must also have been scanned within the last BB_ASYNC_REC_US (300).
+        // after the submission that reads it: a write fault saw it at the binding). Regions the
+        // guest wrote in the last BB_ASYNC_REC_ACTIVE_MS (100) must also have been scanned within
+        // the last BB_ASYNC_REC_US (300). The others (most of a binding of hundreds of MiB) are
+        // not rescanned: on the draw recording thread that was ~400k region scans a second.
         const bool recorder = BbStats::async_required_epoch != 0;
         const u64 now = recorder ? __rdtsc() : 0;
         const u64 window = recorder ? RecorderWindowTicks() : 0;
+        const u64 active = recorder ? RecorderActiveTicks() : 0;
         const auto fresh = [&](RegionManager* manager) {
             return manager->AsyncFresh(required) &&
-                   (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window);
+                   (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window ||
+                    now - std::min(now, manager->AsyncWriteTsc()) >= active);
         };
         // Adjacent regions to scan go in one ioctl (a binding of Ratchet & Clank's 21 MiB
         // per-frame ranges spans six), their locks taken in address order as the scanner does.
@@ -167,6 +171,14 @@ public:
             const char* env = std::getenv("BB_ASYNC_REC_US");
             const double us = env ? std::strtod(env, nullptr) : 300.0;
             return us > 0 ? u64(us * double(BbStats::async_tsc_per_ms.load()) / 1000.0) : ~0ull;
+        }();
+        return ticks;
+    }
+    static u64 RecorderActiveTicks() {
+        static const u64 ticks = [] {
+            const char* env = std::getenv("BB_ASYNC_REC_ACTIVE_MS");
+            const double ms = env ? std::strtod(env, nullptr) : 100.0;
+            return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
         }();
         return ticks;
     }
