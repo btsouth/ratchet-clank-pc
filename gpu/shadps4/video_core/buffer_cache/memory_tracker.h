@@ -106,10 +106,14 @@ public:
                                       ? run[i]->AsyncWriteTsc()
                                       : ~0ull;
                 run[i]->late_scan = write_before[i] != ~0ull;
+                run[i]->late_from = query_cpu_addr;
+                run[i]->late_to = query_size <= LateBindingBytes() ? query_cpu_addr + query_size
+                                                                   : query_cpu_addr;
             }
             ScanRegions({run.data(), run_size}, fresh);
             for (size_t i = 0; i < run_size; ++i) {
                 run[i]->late_scan = false;
+                run[i]->late_from = run[i]->late_to = 0;
                 if (write_before[i] != ~0ull && run[i]->AsyncWriteTsc() != write_before[i]) {
                     run[i]->NoteAsyncLateWrite(now);
                     BbStats::async_late_regions.fetch_add(1, std::memory_order_relaxed);
@@ -201,6 +205,16 @@ public:
         const char* env = std::getenv(name);
         const double ms = env ? std::strtod(env, nullptr) : fallback;
         return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
+    }
+    /// Late writes get page protection where the binding that reads them is at most this big
+    /// (BB_ASYNC_LATE_KB, 4096): constants. Rings of tens of MiB bound whole are written ahead
+    /// all the time; their pages would fault as in fault mode.
+    static u64 LateBindingBytes() {
+        static const u64 bytes = [] {
+            const char* env = std::getenv("BB_ASYNC_LATE_KB");
+            return (env ? std::strtoull(env, nullptr, 10) : 4096ull) << 10;
+        }();
+        return bytes;
     }
     static u64 RecorderActiveTicks() {
         static const u64 ticks = RecorderTicks("BB_ASYNC_REC_ACTIVE_MS", 1000.0);

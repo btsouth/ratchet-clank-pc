@@ -304,8 +304,10 @@ public:
         late_tsc.store(now, std::memory_order_relaxed);
     }
     /// With the lock held: the scans coming are for the draw recording thread's time window
-    /// (MemoryTracker::SyncAsyncWrites): the writes they find are late writes.
+    /// (MemoryTracker::SyncAsyncWrites): the writes they find are late writes. Those in
+    /// [late_from, late_to) (a small binding that reads them) get page protection.
     bool late_scan = false;
+    VAddr late_from = 0, late_to = 0;
     /// The GPU side used the region in `epoch`: the scanner thread keeps it scanned (true: it
     /// was not on its list).
     bool NoteAsyncUse(u64 epoch) noexcept {
@@ -416,11 +418,19 @@ private:
                 const char* env = std::getenv("BB_ASYNC_LATE_PROTECT");
                 return !(env && env[0] == '0');
             }();
-            if (late && protect_late) {
-                for (const auto& [a, b] : RegionBits(hit & ~late_pages)) {
-                    BbStats::async_late_pages.fetch_add(b - a, std::memory_order_relaxed);
+            if (late && protect_late && late_to > late_from) {
+                // Only pages of the binding that read them (late_from, late_to).
+                const size_t first = (std::max(late_from, cpu_addr) - cpu_addr) / TRACKER_BYTES_PER_PAGE;
+                const size_t last = std::min<size_t>(
+                    Common::DivCeil(late_to - std::min(late_to, cpu_addr), TRACKER_BYTES_PER_PAGE),
+                    NUM_PAGES_PER_REGION);
+                if (first < last) {
+                    const RegionBits read(hit, first, last);
+                    for (const auto& [a, b] : RegionBits(read & ~late_pages)) {
+                        BbStats::async_late_pages.fetch_add(b - a, std::memory_order_relaxed);
+                    }
+                    late_pages |= read;
                 }
-                late_pages |= hit;
             }
             for (const auto& [a, b] : hit) {
                 BbStats::async_written_pages.fetch_add(b - a, std::memory_order_relaxed);
