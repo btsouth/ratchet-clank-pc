@@ -57,8 +57,8 @@ public:
     /// must not hold back the frame (and the flip the game's watchdog waits for). Null when
     /// the pipeline is still being built and the wait budget of this shown frame is spent: a
     /// `recurring` draw (geometry into a target drawn in each of the last frames) gets
-    /// BB_PIPELINE_WAIT_MS of it, any other BB_PIPELINE_STALL_MS. A pipeline missing in
-    /// BB_PIPELINE_SKIP_FRAMES shown frames is waited for.
+    /// BB_PIPELINE_WAIT_MS of it, any other BB_PIPELINE_STALL_MS (also a pipeline missing in
+    /// BB_PIPELINE_SKIP_FRAMES shown frames). Its build moves ahead of the queued ones.
     vk::Pipeline HandleForDraw(bool recurring) const {
         if (handle_pending.load(std::memory_order_acquire)) {
             return HandleForDrawSlow(recurring);
@@ -103,11 +103,6 @@ protected:
 
     void WaitHandle() const;
     vk::Pipeline HandleForDrawSlow(bool recurring) const;
-    /// Builds the pipeline on the calling thread if its worker job has not started (and then
-    /// never will); false when it has, or there is no deferred build.
-    virtual bool BuildNow() const {
-        return false;
-    }
     /// Moves its build ahead of the queued ones, if it has not started.
     virtual void Expedite() const {}
     /// Called by the worker once `pipeline` is set.

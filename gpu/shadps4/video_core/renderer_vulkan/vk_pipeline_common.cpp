@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -36,18 +37,30 @@ u64 EnvNumber(const char* name, u64 fallback) {
     return env && *env ? std::strtoull(env, nullptr, 10) : fallback;
 }
 
-/// The time draws of the current shown frame (BbStats::frame_number) spent waiting for
-/// pipelines, on all recording threads together.
+/// The time draws spent waiting for pipelines, on all recording threads together, since the
+/// current shown frame (BbStats::frame_number) began, or since RenewAfter with no frame shown
+/// (offscreen work while loading gets a budget too, not only the frame it began in).
 struct DrawWaitBudget {
-    std::atomic<u32> frame{~0u};
-    std::atomic<u64> used_ns{0};
+    static constexpr auto RenewAfter = std::chrono::milliseconds(500);
+    std::mutex mutex;
+    u32 frame = ~0u;
+    std::chrono::steady_clock::time_point since{};
+    u64 used_ns = 0;
 
     u64 Used(u32 shown) {
-        u32 seen = frame.load(std::memory_order_relaxed);
-        if (seen != shown && frame.compare_exchange_strong(seen, shown)) {
-            used_ns.store(0, std::memory_order_relaxed);
+        std::scoped_lock lk{mutex};
+        const auto now = std::chrono::steady_clock::now();
+        // A recorder that read an older frame number does not take the budget back to it.
+        if (s32(shown - frame) > 0 || frame == ~0u || now - since >= RenewAfter) {
+            frame = s32(shown - frame) > 0 || frame == ~0u ? shown : frame;
+            since = now;
+            used_ns = 0;
         }
-        return used_ns.load(std::memory_order_relaxed);
+        return used_ns;
+    }
+    void Charge(u64 ns) {
+        std::scoped_lock lk{mutex};
+        used_ns += ns;
     }
 };
 DrawWaitBudget draw_wait_budget;
@@ -75,36 +88,27 @@ vk::Pipeline Pipeline::HandleForDrawSlow(bool recurring) const {
         }
         overdue = missing_frames > max_frames;
     }
-    if (overdue) {
-        // Missing for too long: drawn now, built here if its job has not started.
-        if (!BuildNow()) {
-            WaitHandle();
-        }
-        return *pipeline;
-    }
-    const u64 budget = recurring ? recurring_ns : other_ns;
+    // It may be queued behind a hundred others: the next free worker takes it.
+    Expedite();
+    // Missing for long: waited for like a one-time draw, even if it is geometry.
+    const u64 budget = recurring && !overdue ? recurring_ns : other_ns;
     const u64 used = draw_wait_budget.Used(shown);
     if (used >= budget) {
         g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
     const auto start = std::chrono::steady_clock::now();
-    const auto charge = [&] {
-        const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - start)
-                               .count());
-        draw_wait_budget.used_ns.fetch_add(ns, std::memory_order_relaxed);
-        g_bb_pipeline_wait_ns += ns;
-        g_bb_compile_stall_ns += ns;
-    };
-    // It may be queued behind a hundred others: the next free worker takes it.
-    Expedite();
     std::unique_lock lk{handle_mutex};
     const bool ready =
         handle_cv.wait_for(lk, std::chrono::nanoseconds(budget - used),
                            [&] { return !handle_pending.load(std::memory_order_acquire); });
     lk.unlock();
-    charge();
+    const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    draw_wait_budget.Charge(ns);
+    g_bb_pipeline_wait_ns += ns;
+    g_bb_compile_stall_ns += ns;
     if (!ready) {
         g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
         return {};

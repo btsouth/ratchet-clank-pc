@@ -78,7 +78,7 @@ int main() {
     // HandleForDraw: a draw waits for a pipeline still being built at most what is left of the
     // shown frame's budget (8 ms for recurring geometry, 100 ms here for others), then goes
     // without; the budget renews each shown frame; a pipeline missing in more than 3 shown
-    // frames is waited for.
+    // frames is waited for like a one-time draw (here 30 ms, past the 8 ms of geometry).
     const auto timed = [](auto&& call) {
         const auto t = steady_clock::now();
         const vk::Pipeline result = call();
@@ -195,18 +195,6 @@ int main() {
     run_jobs_later(milliseconds(0)).join();
     assert(built.load() == 2);
 
-    // Missing in more than 3 shown frames, with no worker running: the draw builds it itself.
-    auto inline_built = make();
-    for (int frame = 0; frame < 3; ++frame) {
-        shown->fetch_add(1);
-        assert(!inline_built->HandleForDraw(true));
-    }
-    shown->fetch_add(1);
-    const vk::Pipeline inline_handle = inline_built->HandleForDraw(true);
-    assert(inline_handle && !inline_built->IsHandlePending() && built.load() == 3);
-    run_jobs_later(milliseconds(0)).join();
-    assert(built.load() == 3);
-
     // Destroying a pipeline whose build has not started returns at once; its job does nothing.
     auto dropped = make();
     assert(dropped->IsHandlePending());
@@ -214,8 +202,7 @@ int main() {
     dropped.reset();
     assert(steady_clock::now() - drop_start < milliseconds(20));
     run_jobs_later(milliseconds(0)).join();
-    assert(built.load() == 3);
-    inline_built.reset();
+    assert(built.load() == 2);
     queued_behind.reset();
 
     real.reset();
@@ -227,7 +214,7 @@ int main() {
     dispatch.init(device);
     device.destroyShaderModule(vs_module, nullptr, dispatch);
     std::printf("Deferred GraphicsPipeline: built on the worker, bound after it; moved ahead "
-                "of the queue by a draw that waits; built by a draw once missing too long; "
+                "of the queue by a draw that waits; "
                 "dropped before its build without one\n");
     return 0;
 }

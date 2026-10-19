@@ -122,7 +122,6 @@ public:
                          u32 step_rate_1, std::span<const AmdGpu::Buffer> sharps = {}) const;
 
 private:
-    bool BuildNow() const override;
     void Expedite() const override;
     void BuildDescSetLayout(bool preloading);
     void Build(vk::PipelineCache pipeline_cache,
@@ -138,7 +137,8 @@ private:
         std::function<void(const SerializationSupport&)> built;
         std::function<void(std::function<void()>, bool)> submit;
         vk::PipelineCache pipeline_cache;
-        /// Taken by whoever runs the build: the worker, or a thread that needs it first.
+        /// Taken by whoever runs the build: its job or the expedited copy (or the destructor,
+        /// which cancels a build not started).
         std::atomic<bool> claimed{false};
         std::atomic<bool> expedited{false};
     };

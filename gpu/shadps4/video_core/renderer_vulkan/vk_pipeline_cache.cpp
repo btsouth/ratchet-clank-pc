@@ -504,13 +504,15 @@ public:
             worker.join();
         }
     }
-    /// `urgent`: ahead of every queued job (a draw waits for it).
+    /// `urgent`: ahead of the other jobs, after the urgent ones queued before it (a draw waits
+    /// for it; the earliest such draw holds back the frame's later commands).
     void Submit(std::function<void()> job, bool urgent = false) {
         g_bb_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock lk{mutex};
             if (urgent) {
-                jobs.push_front(std::move(job));
+                jobs.insert(jobs.begin() + urgent_queued, std::move(job));
+                ++urgent_queued;
             } else {
                 jobs.push_back(std::move(job));
             }
@@ -535,6 +537,7 @@ private:
                 }
                 job = std::move(jobs.front());
                 jobs.pop_front();
+                urgent_queued -= urgent_queued != 0;
                 ++running;
             }
             job();
@@ -551,6 +554,7 @@ private:
     std::condition_variable idle_cv;
     u32 running = 0;
     std::deque<std::function<void()>> jobs;
+    size_t urgent_queued = 0; ///< the first jobs in `jobs` that are urgent
     std::vector<std::thread> workers;
     bool stop = false;
 };
@@ -599,9 +603,21 @@ double ProfileSeconds() {
 /// (PipelineCache::RecurringDraw) gets BB_SHADER_WAIT_MS of it, other draws BB_SHADER_FRAME_MS.
 /// A first visit brings hundreds of shaders: a few ms each on a slow CPU kept LBP3's flip from
 /// its watchdog (~1 s of translation in one frame on devbox).
+/// With no frame shown for RenewAfter (offscreen work while loading), the budget renews too.
 struct TranslationBudget {
+    static constexpr auto RenewAfter = std::chrono::milliseconds(500);
     u32 frame = ~0u;
+    std::chrono::steady_clock::time_point since{};
     u64 used_ns = 0;
+    void Renew() {
+        const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (shown != frame || now - since >= RenewAfter) {
+            frame = shown;
+            since = now;
+            used_ns = 0;
+        }
+    }
     bool Spent(bool recurring) {
         const auto env_ms = [](const char* name, u64 fallback) {
             const char* env = std::getenv(name);
@@ -609,12 +625,12 @@ struct TranslationBudget {
         };
         static const u64 recurring_ns = env_ms("BB_SHADER_WAIT_MS", 16);
         static const u64 other_ns = env_ms("BB_SHADER_FRAME_MS", 60);
-        const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
-        if (shown != frame) {
-            frame = shown;
-            used_ns = 0;
-        }
+        Renew();
         return used_ns >= (recurring ? recurring_ns : other_ns);
+    }
+    void Charge(u64 ns) {
+        Renew();
+        used_ns += ns;
     }
 };
 TranslationBudget translation_budget; ///< GPU thread only
@@ -1363,9 +1379,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const struct BudgetCharge {
         std::chrono::steady_clock::time_point start;
         ~BudgetCharge() {
-            translation_budget.used_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                  std::chrono::steady_clock::now() - start)
-                                                  .count());
+            translation_budget.Charge(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count()));
         }
     } budget_charge{budget_start};
     CompileTimer timer;

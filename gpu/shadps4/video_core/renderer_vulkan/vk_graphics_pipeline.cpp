@@ -123,15 +123,6 @@ void GraphicsPipeline::RunDeferred(DeferredBuild& job) {
     PublishHandle();
 }
 
-bool GraphicsPipeline::BuildNow() const {
-    if (!deferred || deferred->claimed.exchange(true, std::memory_order_acq_rel)) {
-        return false;
-    }
-    // The handle is not published yet: no other thread reads what the build writes.
-    const_cast<GraphicsPipeline*>(this)->RunDeferred(*deferred);
-    return true;
-}
-
 void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
                              std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                              std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
