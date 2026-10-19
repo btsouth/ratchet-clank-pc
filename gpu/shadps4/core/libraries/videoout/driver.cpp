@@ -642,6 +642,26 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
             VideoCore::PageManager::ReportFaultSites();
+            if (BbStats::async_write_tracking.load(std::memory_order_relaxed)) {
+                const double scans = double(BbStats::async_scans.exchange(0));
+                const double scan_ms = double(BbStats::async_scan_ticks.exchange(0)) /
+                                       double(BbStats::async_tsc_per_ms.load());
+                static u64 last_epoch = 0;
+                const u64 epoch = BbStats::upload_epoch.load();
+                std::printf("Async write tracking: %.0f region scans/s (%.0f/s by the GPU threads, "
+                            "%.0f/s by the draw recording thread, %.0f/s for age), %.1f epochs/frame, %.3f ms/frame scanning, "
+                            "%.0f written pages/s, %llu failed scans\n",
+                            scans / window,
+                            double(BbStats::async_inline_scans.exchange(0)) / window,
+                            double(BbStats::async_recorder_scans.exchange(0)) / window,
+                            double(BbStats::async_age_scans.exchange(0)) / window,
+                            frames ? double(epoch - last_epoch) / frames : 0.0,
+                            frames ? scan_ms / frames : 0.0,
+                            double(BbStats::async_written_pages.exchange(0)) / window,
+                            static_cast<unsigned long long>(
+                                BbStats::async_scan_failures.exchange(0)));
+                last_epoch = epoch;
+            }
             if (const u64 notes = BbStats::cpu_write_notes.exchange(0)) {
                 std::printf("Write notices: %.0f/s, %.2f MB/s (libc copies over pages the GPU side "
                             "watches)\n",

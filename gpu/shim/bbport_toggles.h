@@ -7,6 +7,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Temporary experiment bits: the second number in BB_TOGGLE_FILE (runtime_memory.c).
@@ -102,6 +105,13 @@ inline bool Experiment(std::uint64_t bit) {
 namespace BbStats {
 /// Guest writes caught by page protection, and pages currently left unprotected as hot.
 inline std::atomic<std::uint64_t> tracker_faults{0};
+/// Async write tracking (PageManager::AsyncWrites): region scans (and their TSC ticks), the
+/// written pages they found, scans that failed (all their pages counted as written).
+inline std::atomic<bool> async_write_tracking{false};
+inline std::atomic<std::uint64_t> async_tsc_per_ms{1};
+inline std::atomic<std::uint64_t> async_scans{0}, async_scan_ticks{0}, async_written_pages{0},
+    async_scan_failures{0}, async_inline_scans{0}, async_age_scans{0},
+    async_recorder_scans{0};
 /// Writes the GPU side heard of from the writers (libc copies over watched pages, no write tracking).
 inline std::atomic<std::uint64_t> cpu_write_notes{0}, cpu_write_note_bytes{0};
 /// Ranges the game's GPU memory allocator handed out (guest hook, BB_GUEST_IN_PLACE).
@@ -132,6 +142,23 @@ inline std::atomic<std::int64_t> hot_pages{0};
 /// Guest submissions the GPU thread has finished (Rasterizer::OnSubmit): hot pages are uploaded
 /// once per submission they are used in (RegionManager::RefreshHotPages).
 inline std::atomic<std::uint64_t> upload_epoch{1};
+/// Async write tracking: futex word of the scanner thread (MemoryTracker::AsyncScanner), set
+/// while it sleeps.
+inline std::atomic<std::uint32_t> async_wake{0};
+/// The epoch whose writes the work of this thread must see (the draw recording thread: when its
+/// packet was decoded); 0: the current one.
+inline thread_local std::uint64_t async_required_epoch = 0;
+inline std::atomic<bool> async_scanner_idle{false};
+/// A new upload epoch (a guest submission, a met WaitRegMem, a frame): what the guest wrote
+/// before it may be read by the GPU from here on. Wakes the async write tracking scanner.
+inline void NewUploadEpoch() {
+    upload_epoch.fetch_add(1, std::memory_order_seq_cst);
+    if (async_scanner_idle.load(std::memory_order_seq_cst)) {
+        async_wake.fetch_add(1, std::memory_order_release);
+        syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&async_wake), FUTEX_WAKE_PRIVATE, 1,
+                nullptr, nullptr, 0);
+    }
+}
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};

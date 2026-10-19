@@ -2304,7 +2304,7 @@ void Rasterizer::Finish() {
 
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
-    BbStats::upload_epoch.fetch_add(1, std::memory_order_relaxed);
+    BbStats::NewUploadEpoch();
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -4694,6 +4694,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
             BbWriteLog::Note(address, buffer, num_bytes, BbWriteLog::Dma);
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(address, num_bytes);
+            } else {
+                NoteHostWrite(address, num_bytes);
             }
             return;
         }
@@ -4737,6 +4739,8 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             BbWriteLog::Note(dst, std::bit_cast<const void*>(dst), num_bytes, BbWriteLog::Dma);
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(dst, num_bytes);
+            } else {
+                NoteHostWrite(dst, num_bytes);
             }
             return;
         }
@@ -4801,6 +4805,7 @@ void Rasterizer::InvalidateAfterWrite(VAddr addr, u64 size) {
 }
 
 void Rasterizer::NoteCommandWrite(VAddr addr, const void* data, u64 size, bool recording_thread) {
+    NoteHostWrite(addr, size);
     if (VideoCore::WriteTracking() || !IsMapped(addr, size)) {
         return; // tracking catches it, or the GPU does not use it
     }

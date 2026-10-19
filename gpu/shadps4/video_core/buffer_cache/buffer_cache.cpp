@@ -2396,6 +2396,10 @@ void BufferCache::ProcessPendingAssets() {
     }
 }
 
+void BufferCache::NoteHostWrite(VAddr addr, u64 size) {
+    memory_tracker->NoteHostWrite(addr, size);
+}
+
 void BufferCache::NoteLateCommandWrite(VAddr addr, const void* data, u64 size) {
     if (!GuestInPlace() || WriteTracking() || size == 0) {
         return;
