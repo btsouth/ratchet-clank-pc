@@ -117,6 +117,9 @@ inline std::atomic<std::uint64_t> async_scans{0}, async_scan_ticks{0}, async_wri
 /// (RegionManager::CatchWritesEnteringSync) and the written pages they found.
 inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
     async_entry_pages{0};
+/// Rescans for the time window that found late writes (their region is rescanned for
+/// BB_ASYNC_REC_LATE_MS).
+inline std::atomic<std::uint64_t> async_late_regions{0};
 /// Writes the GPU side heard of from the writers (libc copies over watched pages, no write tracking).
 inline std::atomic<std::uint64_t> cpu_write_notes{0}, cpu_write_note_bytes{0};
 /// Ranges the game's GPU memory allocator handed out (guest hook, BB_GUEST_IN_PLACE).

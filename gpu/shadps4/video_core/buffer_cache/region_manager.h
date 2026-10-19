@@ -291,6 +291,14 @@ public:
     [[nodiscard]] u64 AsyncWriteTsc() const noexcept {
         return write_tsc.load(std::memory_order_relaxed);
     }
+    /// TSC of the last rescan by the draw recording thread that found writes the scan of its
+    /// packet's epoch had not seen (writes after the submission that reads them).
+    [[nodiscard]] u64 AsyncLateTsc() const noexcept {
+        return late_tsc.load(std::memory_order_relaxed);
+    }
+    void NoteAsyncLateWrite(u64 now) noexcept {
+        late_tsc.store(now, std::memory_order_relaxed);
+    }
     /// The GPU side used the region in `epoch`: the scanner thread keeps it scanned (true: it
     /// was not on its list).
     bool NoteAsyncUse(u64 epoch) noexcept {
@@ -645,7 +653,7 @@ private:
     /// bbport (async write tracking): pages with page protection from this region (the other
     /// protected ones are found by scans).
     RegionBits sync;
-    std::atomic<u64> scan_epoch{0}, scan_tsc{0}, write_tsc{0};
+    std::atomic<u64> scan_epoch{0}, scan_tsc{0}, write_tsc{0}, late_tsc{0};
     std::atomic<u64> use_epoch{0};
     std::atomic<bool> async_listed{false};
     u64 async_generation = 0;

@@ -649,12 +649,13 @@ void VideoOutDriver::Flip(const Request& req) {
                 static u64 last_epoch = 0;
                 const u64 epoch = BbStats::upload_epoch.load();
                 std::printf("Async write tracking: %.0f region scans/s (%.0f/s by the GPU threads, "
-                            "%.0f/s by the draw recording thread, %.0f/s of them for its time window, %.0f/s for age), %.1f epochs/frame, %.3f ms/frame scanning, "
+                            "%.0f/s by the draw recording thread, %.0f/s of them for its time window, %.0f/s finding late writes, %.0f/s for age), %.1f epochs/frame, %.3f ms/frame scanning, "
                             "%.0f written pages/s, %llu failed scans, %llu entry scans (%llu pages)\n",
                             scans / window,
                             double(BbStats::async_inline_scans.exchange(0)) / window,
                             double(BbStats::async_recorder_scans.exchange(0)) / window,
                             double(BbStats::async_window_scans.exchange(0)) / window,
+                            double(BbStats::async_late_regions.exchange(0)) / window,
                             double(BbStats::async_age_scans.exchange(0)) / window,
                             frames ? double(epoch - last_epoch) / frames : 0.0,
                             frames ? scan_ms / frames : 0.0,

@@ -67,17 +67,24 @@ public:
         // The draw recording thread runs behind the guest: a packet may read bytes the guest
         // wrote after it was decoded with no submission or wait between (data it updates late,
         // after the submission that reads it: a write fault saw it at the binding). Regions the
-        // guest wrote in the last BB_ASYNC_REC_ACTIVE_MS (100) must also have been scanned within
-        // the last BB_ASYNC_REC_US (300). The others (most of a binding of hundreds of MiB) are
-        // not rescanned: on the draw recording thread that was ~400k region scans a second.
+        // guest wrote in the last BB_ASYNC_REC_ACTIVE_MS (1000; some get their late writes in
+        // bursts 60-250 ms apart), or where such a rescan found late writes in the last
+        // BB_ASYNC_REC_LATE_MS (10000), must also have been scanned within the last
+        // BB_ASYNC_REC_US (300). The others (most of a binding of hundreds of MiB) are not
+        // rescanned: on the draw recording thread that was ~400k region scans a second.
         const bool recorder = BbStats::async_required_epoch != 0;
         const u64 now = recorder ? __rdtsc() : 0;
         const u64 window = recorder ? RecorderWindowTicks() : 0;
         const u64 active = recorder ? RecorderActiveTicks() : 0;
+        const u64 late = recorder ? RecorderLateTicks() : 0;
+        const auto quiet = [&](RegionManager* manager) {
+            return now - std::min(now, manager->AsyncWriteTsc()) >= active &&
+                   now - std::min(now, manager->AsyncLateTsc()) >= late;
+        };
         const auto fresh = [&](RegionManager* manager) {
             return manager->AsyncFresh(required) &&
                    (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window ||
-                    now - std::min(now, manager->AsyncWriteTsc()) >= active);
+                    quiet(manager));
         };
         // Adjacent regions to scan go in one ioctl (a binding of Ratchet & Clank's 21 MiB
         // per-frame ranges spans six), their locks taken in address order as the scanner does.
@@ -87,11 +94,20 @@ public:
             if (run_size == 0) {
                 return;
             }
+            // Regions due only to the time window: writes found there are late writes.
+            std::array<u64, 16> write_before{};
             for (size_t i = 0; i < run_size; ++i) {
                 run[i]->lock.lock();
+                write_before[i] = recorder && run[i]->AsyncFresh(required)
+                                      ? run[i]->AsyncWriteTsc()
+                                      : ~0ull;
             }
             ScanRegions({run.data(), run_size}, fresh);
             for (size_t i = 0; i < run_size; ++i) {
+                if (write_before[i] != ~0ull && run[i]->AsyncWriteTsc() != write_before[i]) {
+                    run[i]->NoteAsyncLateWrite(now);
+                    BbStats::async_late_regions.fetch_add(1, std::memory_order_relaxed);
+                }
                 run[i]->lock.unlock();
             }
             run_size = 0;
@@ -174,12 +190,18 @@ public:
         }();
         return ticks;
     }
+    /// A time in ms from `name` (`fallback` if unset; 0: forever) in TSC ticks.
+    static u64 RecorderTicks(const char* name, double fallback) {
+        const char* env = std::getenv(name);
+        const double ms = env ? std::strtod(env, nullptr) : fallback;
+        return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
+    }
     static u64 RecorderActiveTicks() {
-        static const u64 ticks = [] {
-            const char* env = std::getenv("BB_ASYNC_REC_ACTIVE_MS");
-            const double ms = env ? std::strtod(env, nullptr) : 100.0;
-            return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
-        }();
+        static const u64 ticks = RecorderTicks("BB_ASYNC_REC_ACTIVE_MS", 1000.0);
+        return ticks;
+    }
+    static u64 RecorderLateTicks() {
+        static const u64 ticks = RecorderTicks("BB_ASYNC_REC_LATE_MS", 10000.0);
         return ticks;
     }
 
