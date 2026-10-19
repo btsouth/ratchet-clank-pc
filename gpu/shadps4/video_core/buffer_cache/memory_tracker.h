@@ -648,7 +648,7 @@ private:
     static u64 HeadUs() {
         static const u64 us = [] {
             const char* env = std::getenv("BB_ASYNC_HEAD_US");
-            return env ? std::strtoull(env, nullptr, 10) : 50ull;
+            return env ? std::strtoull(env, nullptr, 10) : 0ull;
         }();
         return us;
     }
