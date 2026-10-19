@@ -71,6 +71,8 @@ public:
     /// Appends the runs of pages in [addr, addr + size) written since they were last scanned and
     /// protects them again (one ioctl). False: the scan failed, every page counts as written.
     bool ScanWritten(VAddr addr, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs) const;
+    /// Diagnostics: the written runs without protecting them again.
+    bool PeekWritten(VAddr addr, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs) const;
     /// TSC ticks after which a region is scanned again even without a new guest submission or
     /// wait (BB_ASYNC_WP_US, default 4000 us; 0: only then).
     [[nodiscard]] u64 AsyncMaxAgeTicks() const noexcept;

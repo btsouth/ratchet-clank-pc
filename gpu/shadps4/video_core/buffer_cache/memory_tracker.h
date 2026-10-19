@@ -95,6 +95,42 @@ public:
         }
     }
 
+    /// Diagnostics (BB_ASYNC_VERIFY=1): pages of the range the guest wrote that are not marked
+    /// CPU-modified after SyncAsyncWrites (a write fault would have marked them).
+    void VerifyAsyncWrites(VAddr query_cpu_addr, u64 query_size) {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_ASYNC_VERIFY");
+            return env && env[0] == '1';
+        }();
+        if (!on || !tracker->AsyncWrites() || query_size == 0 || query_size > (16ull << 20)) {
+            return;
+        }
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        runs.clear();
+        const VAddr from = query_cpu_addr & ~VAddr(4095);
+        const VAddr to = (query_cpu_addr + query_size + 4095) & ~VAddr(4095);
+        BbStats::verify_checks.fetch_add(1, std::memory_order_relaxed);
+        if (!tracker->PeekWritten(from, to - from, runs)) {
+            return;
+        }
+        u64 stale = 0;
+        for (const auto& [a, b] : runs) {
+            for (VAddr page = a; page < b; page += 4096) {
+                auto* manager = top_tier[page >> TRACKER_HIGHER_PAGE_BITS];
+                if (manager && !manager->template IsRegionModified<Type::CPU>(
+                                   page - manager->GetCpuAddr(), 4096)) {
+                    ++stale;
+                }
+            }
+        }
+        if (stale) {
+            BbStats::verify_stale_checks.fetch_add(1, std::memory_order_relaxed);
+            BbStats::verify_stale_pages.fetch_add(stale, std::memory_order_relaxed);
+            BbStats::NoteVerifyStale(query_cpu_addr, query_size, stale,
+                                     BbStats::async_required_epoch != 0);
+        }
+    }
+
     /// bbport (async write tracking): the GPU side wrote [addr, addr + size) itself (command
     /// processor writes): those pages are CPU-modified, as a write fault would have marked them.
     void NoteHostWrite(VAddr addr, u64 size) {
@@ -110,6 +146,7 @@ public:
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         SyncAsyncWrites(query_cpu_addr, query_size);
+        VerifyAsyncWrites(query_cpu_addr, query_size);
         if (!BbToggle::Disabled(BbToggle::LockFreeUploadCheck) &&
             !MaybeCpuModified(query_cpu_addr, query_size)) {
             return false;
@@ -212,6 +249,7 @@ public:
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         SyncAsyncWrites(query_cpu_range, query_size);
+        VerifyAsyncWrites(query_cpu_range, query_size);
         // bbport: a write binding over pages the CPU did not change and the GPU already owns
         // needs neither an upload nor a state change (it ran under the region lock for every
         // GPU write binding, twice per page). Racing guest writes are as in the read path.

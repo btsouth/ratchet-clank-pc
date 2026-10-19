@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -112,6 +113,38 @@ inline std::atomic<std::uint64_t> async_tsc_per_ms{1};
 inline std::atomic<std::uint64_t> async_scans{0}, async_scan_ticks{0}, async_written_pages{0},
     async_scan_failures{0}, async_inline_scans{0}, async_age_scans{0},
     async_recorder_scans{0};
+/// Async write tracking diagnostics (BB_ASYNC_VERIFY=1, MemoryTracker::VerifyAsyncWrites).
+inline std::atomic<std::uint64_t> verify_checks{0}, verify_stale_checks{0}, verify_stale_pages{0};
+struct VerifyStale {
+    std::uint64_t addr, size, pages, count, recorder;
+};
+inline std::mutex verify_mutex;
+inline VerifyStale verify_table[64];
+inline void NoteVerifyStale(std::uint64_t addr, std::uint64_t size, std::uint64_t pages,
+                            bool recorder) {
+    std::scoped_lock lk{verify_mutex};
+    VerifyStale* slot = nullptr;
+    for (auto& e : verify_table) {
+        if (e.count && e.addr == addr && e.size == size) {
+            slot = &e;
+            break;
+        }
+        if (!slot && e.count == 0) {
+            slot = &e;
+        }
+    }
+    if (!slot) {
+        slot = &verify_table[addr % 64];
+        *slot = {};
+    }
+    if (slot->count == 0) {
+        slot->addr = addr;
+        slot->size = size;
+    }
+    slot->pages += pages;
+    slot->count += 1;
+    slot->recorder += recorder;
+}
 /// Writes the GPU side heard of from the writers (libc copies over watched pages, no write tracking).
 inline std::atomic<std::uint64_t> cpu_write_notes{0}, cpu_write_note_bytes{0};
 /// Ranges the game's GPU memory allocator handed out (guest hook, BB_GUEST_IN_PLACE).

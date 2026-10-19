@@ -657,6 +657,31 @@ void VideoOutDriver::Flip(const Request& req) {
                                 BbStats::async_scan_failures.exchange(0)));
                 last_epoch = epoch;
             }
+            if (const u64 checks = BbStats::verify_checks.exchange(0)) {
+                std::printf("Async verify: %.0f checks/s, %.0f stale/s, %.0f stale pages/s;",
+                            double(checks) / window,
+                            double(BbStats::verify_stale_checks.exchange(0)) / window,
+                            double(BbStats::verify_stale_pages.exchange(0)) / window);
+                std::scoped_lock lk{BbStats::verify_mutex};
+                BbStats::VerifyStale top[5]{};
+                for (auto& e : BbStats::verify_table) {
+                    for (auto& t : top) {
+                        if (e.count > t.count) {
+                            std::swap(t, e);
+                        }
+                    }
+                    e = {};
+                }
+                for (const auto& t : top) {
+                    if (t.count) {
+                        std::printf(" %#llx+%#llx x%llu (%llu pages, %llu rec)",
+                                    (unsigned long long)t.addr, (unsigned long long)t.size,
+                                    (unsigned long long)t.count, (unsigned long long)t.pages,
+                                    (unsigned long long)t.recorder);
+                    }
+                }
+                std::printf("\n");
+            }
             if (const u64 notes = BbStats::cpu_write_notes.exchange(0)) {
                 std::printf("Write notices: %.0f/s, %.2f MB/s (libc copies over pages the GPU side "
                             "watches)\n",
