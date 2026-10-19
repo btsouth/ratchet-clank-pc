@@ -399,6 +399,17 @@ void StoreLabel(void* address, u64 value, u32 num_bytes) {
     }
 }
 
+// bbport diag (BB_ASYNC_DIAG=3): a new upload epoch at every other wait too.
+static void DiagEpoch() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_ASYNC_DIAG");
+        return env && std::atoi(env) == 3;
+    }();
+    if (on) {
+        BbStats::NewUploadEpoch();
+    }
+}
+
 void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq) {
     eop.SignalFence(
         [seq](void* address, u64 data, u32 num_bytes) {
@@ -2155,6 +2166,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
+                    DiagEpoch(); // bbport diag
                 }
                 break;
             }
@@ -2170,6 +2182,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
+                DiagEpoch(); // bbport diag
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
@@ -2190,6 +2203,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     g_gfx_wait.Begin(1, wait_reg_mem);
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    DiagEpoch(); // bbport diag
                     g_gfx_wait.End();
                     break;
                 }
@@ -2203,6 +2217,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (dcb_stats) {
                         ++g_dcb_stats.wait_outcome[1];
                     }
+                    DiagEpoch(); // bbport diag
                     break;
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
@@ -2615,6 +2630,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
+                DiagEpoch(); // bbport diag
             }
             break;
         }
