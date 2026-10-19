@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <thread>
 #include <time.h>
+#include <unordered_map>
 #include <vector>
 #include <x86intrin.h>
 #include "common/thread.h"
@@ -95,30 +96,52 @@ public:
         }
     }
 
-    /// Diagnostics (BB_ASYNC_VERIFY=1): pages of the range the guest wrote that are not marked
-    /// CPU-modified after SyncAsyncWrites (a write fault would have marked them).
-    void VerifyAsyncWrites(VAddr query_cpu_addr, u64 query_size) {
+    /// Diagnostics (BB_ASYNC_VERIFY=1): pages uploaded from the guest's memory get a hash of
+    /// their bytes; a binding that finds a page clean (left to scans, not CPU-modified) whose
+    /// bytes changed since counts as stale: a write fault would have marked it.
+    static bool VerifyOn() {
         static const bool on = [] {
             const char* env = std::getenv("BB_ASYNC_VERIFY");
             return env && env[0] == '1';
         }();
-        if (!on || !tracker->AsyncWrites() || query_size == 0 || query_size > (16ull << 20)) {
+        return on;
+    }
+    static u64 PageHash(VAddr page) {
+        const auto* p = reinterpret_cast<const u64*>(page);
+        u64 h = 0x9E3779B97F4A7C15ull;
+        for (size_t i = 0; i < 4096 / 8; ++i) {
+            h = (h ^ p[i]) * 0xff51afd7ed558ccdull;
+            h ^= h >> 29;
+        }
+        return h;
+    }
+    void NoteUploaded(VAddr addr, u64 size) {
+        if (!VerifyOn() || !tracker->AsyncWrites()) {
             return;
         }
-        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
-        runs.clear();
-        const VAddr from = query_cpu_addr & ~VAddr(4095);
-        const VAddr to = (query_cpu_addr + query_size + 4095) & ~VAddr(4095);
+        std::scoped_lock lk{verify_mutex};
+        for (VAddr page = addr & ~VAddr(4095); page < addr + size; page += 4096) {
+            verify_hashes[page] = PageHash(page);
+        }
+    }
+    void VerifyAsyncWrites(VAddr query_cpu_addr, u64 query_size) {
+        if (!VerifyOn() || !tracker->AsyncWrites() || query_size == 0 ||
+            query_size > (256ull << 10)) {
+            return;
+        }
         BbStats::verify_checks.fetch_add(1, std::memory_order_relaxed);
-        if (!tracker->PeekWritten(from, to - from, runs)) {
-            return;
-        }
         u64 stale = 0;
-        for (const auto& [a, b] : runs) {
-            for (VAddr page = a; page < b; page += 4096) {
+        {
+            std::scoped_lock lk{verify_mutex};
+            for (VAddr page = query_cpu_addr & ~VAddr(4095); page < query_cpu_addr + query_size;
+                 page += 4096) {
                 auto* manager = top_tier[page >> TRACKER_HIGHER_PAGE_BITS];
-                if (manager && manager->AsyncPage((page - manager->GetCpuAddr()) /
-                                                  TRACKER_BYTES_PER_PAGE)) {
+                if (!manager ||
+                    !manager->AsyncPage((page - manager->GetCpuAddr()) / TRACKER_BYTES_PER_PAGE)) {
+                    continue;
+                }
+                const auto it = verify_hashes.find(page);
+                if (it != verify_hashes.end() && it->second != PageHash(page)) {
                     ++stale;
                 }
             }
@@ -271,8 +294,12 @@ public:
                 return;
             }
         }
+        const auto noted_func = [&](u64 addr, u64 size) {
+            NoteUploaded(addr, size);
+            func(addr, size);
+        };
         IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                           [&noted_func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                // bbport: read-only bindings skip the region lock when no page
                                // in range is CPU-modified. A guest write sets its bit in the
                                // fault handler before the store, and the draw that uses the
@@ -284,7 +311,7 @@ public:
                                }
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
+                                   manager->GetCpuAddr() + offset, size, noted_func);
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
@@ -527,6 +554,8 @@ private:
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
     RegionSummary<NUM_HIGH_PAGES> cpu_summary;
+    std::mutex verify_mutex;
+    std::unordered_map<VAddr, u64> verify_hashes;
     std::mutex async_mutex;
     std::vector<RegionManager*> async_regions;
     std::atomic<bool> async_regions_changed{false};
