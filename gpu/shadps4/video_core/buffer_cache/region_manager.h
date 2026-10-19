@@ -441,9 +441,45 @@ private:
     /// read back before the guest's bytes land) and memory not registered for async tracking.
     /// The others are left writable and found by ScanAsyncWrites. Pages under images get page
     /// protection from the texture cache's own watchers.
+    /// Diagnostics: BB_ASYNC_SYNC=ADDR:SIZE[,ADDR:SIZE...] keeps those pages page-protected.
+    RegionBits ForcedSyncPages() const {
+        struct Range {
+            VAddr from, to;
+        };
+        static const std::vector<Range> ranges = [] {
+            std::vector<Range> out;
+            const char* env = std::getenv("BB_ASYNC_SYNC");
+            while (env && *env) {
+                char* end = nullptr;
+                const VAddr addr = std::strtoull(env, &end, 0);
+                if (!end || *end != ':') {
+                    break;
+                }
+                const u64 size = std::strtoull(end + 1, &end, 0);
+                out.push_back({addr, addr + size});
+                env = end && *end == ',' ? end + 1 : nullptr;
+            }
+            return out;
+        }();
+        RegionBits bits;
+        bits.Clear();
+        for (const auto& r : ranges) {
+            const VAddr from = std::max(r.from, cpu_addr);
+            const VAddr to = std::min<VAddr>(r.to, cpu_addr + TRACKER_HIGHER_PAGE_SIZE);
+            if (from < to) {
+                bits.SetRange((from - cpu_addr) / TRACKER_BYTES_PER_PAGE,
+                              Common::DivCeil(to - cpu_addr, TRACKER_BYTES_PER_PAGE));
+            }
+        }
+        return bits;
+    }
+
     void UpdateWriteProtection() {
         const RegionBits protected_pages = ~cpu;
-        const RegionBits want_sync = async_covered ? (protected_pages & gpu) : protected_pages;
+        static const bool forced = std::getenv("BB_ASYNC_SYNC") != nullptr;
+        const RegionBits want_sync =
+            async_covered ? (protected_pages & (forced ? (gpu | ForcedSyncPages()) : gpu))
+                          : protected_pages;
         writeable = cpu;
         RegionBits add = want_sync & ~sync;
         RegionBits remove = sync & ~want_sync;
