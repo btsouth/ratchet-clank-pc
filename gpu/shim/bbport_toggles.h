@@ -112,6 +112,11 @@ inline std::atomic<std::uint64_t> async_tsc_per_ms{1};
 inline std::atomic<std::uint64_t> async_scans{0}, async_scan_ticks{0}, async_written_pages{0},
     async_scan_failures{0}, async_inline_scans{0}, async_age_scans{0},
     async_recorder_scans{0};
+/// Scans by the draw recording thread of regions fresh for its epoch but not scanned within
+/// BB_ASYNC_REC_US (MemoryTracker::SyncAsyncWrites); scans of pages getting page protection
+/// (RegionManager::CatchWritesEnteringSync) and the written pages they found.
+inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
+    async_entry_pages{0};
 /// Writes the GPU side heard of from the writers (libc copies over watched pages, no write tracking).
 inline std::atomic<std::uint64_t> cpu_write_notes{0}, cpu_write_note_bytes{0};
 /// Ranges the game's GPU memory allocator handed out (guest hook, BB_GUEST_IN_PLACE).

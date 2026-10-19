@@ -8,6 +8,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <thread>
 #include <time.h>
@@ -55,35 +56,119 @@ public:
     /// WaitRegMem; what the guest wrote before it lets the GPU go on; the draw recording thread's
     /// packets carry the epoch they were decoded in). The scanner thread scans the regions in use
     /// as soon as the epoch changes, and every BB_ASYNC_WP_US besides; the caller scans the ones
-    /// it did not get to yet.
+    /// it did not get to yet. The draw recording thread also rescans regions not scanned within
+    /// BB_ASYNC_REC_US.
     void SyncAsyncWrites(VAddr query_cpu_addr, u64 query_size, bool keep_scanned = true) {
         if (!tracker->AsyncWrites() || query_size == 0) {
             return;
         }
         const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
         const u64 required = BbStats::async_required_epoch ? BbStats::async_required_epoch : epoch;
+        // The draw recording thread runs behind the guest: a packet may read bytes the guest
+        // wrote after it was decoded with no submission or wait between (data it updates late,
+        // after the submission that reads it: a write fault saw it at the binding). Its regions
+        // must also have been scanned within the last BB_ASYNC_REC_US (300).
+        const bool recorder = BbStats::async_required_epoch != 0;
+        const u64 now = recorder ? __rdtsc() : 0;
+        const u64 window = recorder ? RecorderWindowTicks() : 0;
+        const auto fresh = [&](RegionManager* manager) {
+            return manager->AsyncFresh(required) &&
+                   (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window);
+        };
+        // Adjacent regions to scan go in one ioctl (a binding of Ratchet & Clank's 21 MiB
+        // per-frame ranges spans six), their locks taken in address order as the scanner does.
+        std::array<RegionManager*, 16> run;
+        size_t run_size = 0;
+        const auto scan_run = [&] {
+            if (run_size == 0) {
+                return;
+            }
+            for (size_t i = 0; i < run_size; ++i) {
+                run[i]->lock.lock();
+            }
+            ScanRegions({run.data(), run_size}, fresh);
+            for (size_t i = 0; i < run_size; ++i) {
+                run[i]->lock.unlock();
+            }
+            run_size = 0;
+        };
         const u64 last = (query_cpu_addr + query_size - 1) >> TRACKER_HIGHER_PAGE_BITS;
         for (u64 index = query_cpu_addr >> TRACKER_HIGHER_PAGE_BITS; index <= last; ++index) {
             auto* manager = top_tier[index];
             if (!manager) {
+                scan_run();
                 continue;
             }
             if (keep_scanned && manager->NoteAsyncUse(epoch)) {
                 ListForScanner(manager);
             }
-            if (manager->AsyncFresh(required)) {
+            if (fresh(manager)) {
+                scan_run();
                 continue;
             }
-            std::scoped_lock lk{manager->lock};
-            if (!manager->AsyncFresh(required)) {
-                BbStats::async_inline_scans.fetch_add(1, std::memory_order_relaxed);
-                if (BbStats::async_required_epoch) {
-                    BbStats::async_recorder_scans.fetch_add(1, std::memory_order_relaxed);
-                }
-                manager->ScanAsyncWrites(BbStats::upload_epoch.load(std::memory_order_acquire),
-                                         __rdtsc());
+            if (manager->AsyncFresh(required)) {
+                BbStats::async_window_scans.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (run_size == run.size()) {
+                scan_run();
+            }
+            run[run_size++] = manager;
+        }
+        scan_run();
+    }
+
+    /// With the regions' locks held (adjacent regions, in address order): the ones still not
+    /// fresh are scanned in one ioctl. Every region in the span the ioctl covers takes part (it
+    /// protects the written pages of all of them again).
+    template <typename Fresh>
+    void ScanRegions(std::span<RegionManager*> regions, const Fresh& fresh) {
+        const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
+        const u64 now = __rdtsc();
+        thread_local std::vector<RegionManager*> active;
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        active.clear();
+        bool any = false;
+        for (auto* manager : regions) {
+            any = any || !fresh(manager);
+        }
+        if (!any) {
+            return;
+        }
+        for (auto* manager : regions) {
+            BbStats::async_inline_scans.fetch_add(1, std::memory_order_relaxed);
+            if (BbStats::async_required_epoch) {
+                BbStats::async_recorder_scans.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (manager->BeginAsyncScan(epoch, now)) {
+                active.push_back(manager);
             }
         }
+        if (active.empty()) {
+            return;
+        }
+        runs.clear();
+        const VAddr from = active.front()->GetCpuAddr();
+        const VAddr to = active.back()->GetCpuAddr() + TRACKER_HIGHER_PAGE_SIZE;
+        const u64 t0 = __rdtsc();
+        const bool ok = tracker->ScanWritten(from, to - from, runs);
+        BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
+        BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        for (auto* manager : active) {
+            if (ok) {
+                manager->FinishAsyncScan(runs, epoch, now);
+            } else {
+                manager->ScanAsyncWrites(epoch, now); // on its own: which one failed
+            }
+        }
+    }
+
+    static u64 RecorderWindowTicks() {
+        static const u64 ticks = [] {
+            const char* env = std::getenv("BB_ASYNC_REC_US");
+            const double us = env ? std::strtod(env, nullptr) : 300.0;
+            return us > 0 ? u64(us * double(BbStats::async_tsc_per_ms.load()) / 1000.0) : ~0ull;
+        }();
+        return ticks;
     }
 
     /// bbport (async write tracking): the GPU side wrote [addr, addr + size) itself (command
@@ -224,8 +309,16 @@ public:
                 return;
             }
         }
+        // Async write tracking: a GPU write binding makes its pages GPU-owned before the upload.
+        // They get page protection and are scanned after it (RegionManager::
+        // CatchWritesEnteringSync), so a guest write not reported yet is uploaded now, before the
+        // GPU writes there; a later one faults. (Precise readbacks read-protect GPU pages, which
+        // the upload reads: there the order stays.)
+        const bool gpu_first = is_written && tracker->AsyncWrites() &&
+                               EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
         IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                           [&func, is_written, gpu_first](RegionManager* manager, u64 offset,
+                                                          size_t size) {
                                // bbport: read-only bindings skip the region lock when no page
                                // in range is CPU-modified. A guest write sets its bit in the
                                // fault handler before the store, and the draw that uses the
@@ -236,6 +329,10 @@ public:
                                    return;
                                }
                                manager->lock.lock();
+                               if (gpu_first) {
+                                   manager->template ChangeRegionState<Type::GPU, true>(
+                                       manager->GetCpuAddr() + offset, size);
+                               }
                                manager->template ForEachModifiedRange<Type::CPU, true>(
                                    manager->GetCpuAddr() + offset, size, func);
                                if (!is_written) {
@@ -247,9 +344,11 @@ public:
             return;
         }
         IteratePages<false>(query_cpu_range, query_size,
-                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
-                                manager->template ChangeRegionState<Type::GPU, true>(
-                                    manager->GetCpuAddr() + offset, size);
+                            [gpu_first](RegionManager* manager, u64 offset, size_t size) {
+                                if (!gpu_first) {
+                                    manager->template ChangeRegionState<Type::GPU, true>(
+                                        manager->GetCpuAddr() + offset, size);
+                                }
                                 manager->lock.unlock();
                             });
     }
