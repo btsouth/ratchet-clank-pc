@@ -60,8 +60,17 @@ public:
         if (!tracker->AsyncWrites() || query_size == 0) {
             return;
         }
+        // Diagnostics: BB_ASYNC_DIAG=1 scans at every use (nothing counts as fresh), 2 ignores
+        // the packet's epoch (the current one is required).
+        static const int diag = [] {
+            const char* env = std::getenv("BB_ASYNC_DIAG");
+            return env ? std::atoi(env) : 0;
+        }();
         const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
-        const u64 required = BbStats::async_required_epoch ? BbStats::async_required_epoch : epoch;
+        const u64 required = diag == 1 ? ~0ull
+                             : BbStats::async_required_epoch && diag != 2
+                                 ? BbStats::async_required_epoch
+                                 : epoch;
         const u64 last = (query_cpu_addr + query_size - 1) >> TRACKER_HIGHER_PAGE_BITS;
         for (u64 index = query_cpu_addr >> TRACKER_HIGHER_PAGE_BITS; index <= last; ++index) {
             auto* manager = top_tier[index];
