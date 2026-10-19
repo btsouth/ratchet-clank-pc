@@ -15,10 +15,10 @@ by deadinside28, and keeps its loader, runtime and renderer. Only this one game 
 dumped from your own PS4. This project is not affiliated with Sony Interactive Entertainment or
 Insomniac Games.
 
-**Status: experimental.** The game boots, plays its cutscenes, saves and loads, and plays with
-sound and a controller. Veldin has been played and other planets load, but no one has finished the
-game on it yet. It has been tested on one desktop (Intel Core i7-14700F, NVIDIA RTX 4070 SUPER) and,
-for correctness only, on an Intel iGPU.
+**Status: experimental, release 0.1.** The game boots, plays its cutscenes, saves and loads, and
+plays with sound and a controller. Every planet loads and plays at the 60 FPS preset, but no one
+has finished the game on it yet. It has been tested on one desktop (Intel Core i7-14700F, NVIDIA
+RTX 4070 SUPER) and, for correctness only, on an Intel iGPU.
 
 ## Requirements
 
@@ -46,8 +46,9 @@ Do not ask for game files in this project's issues. They will be closed.
 
 ### AppImage (recommended)
 
-1. Download `Ratchet-Clank-port-x86_64.AppImage` from the releases page. No release has been
-   published yet; until then, build from source (below).
+1. Download `Ratchet-Clank-port-x86_64.AppImage` from the
+   [releases page](https://github.com/btsouth/ratchet-clank-pc/releases). The `.sha256` file next
+   to it lets you check the download with `sha256sum -c`.
 2. Make it executable and start it:
 
    ```bash
@@ -108,8 +109,8 @@ The game's 120 FPS and Unlocked modes are patched in by the port. The game's own
 too, so it does not run faster at higher frame rates. On the tested RTX 4070 SUPER the 120 FPS mode
 runs at about 80 FPS in busy scenes, because the CPU side is the limit.
 
-Settings are stored in `bbport.ini` in the data folder. The in-game overlay (Insert key) can change
-some of them while you play.
+Settings are stored in `bbport.ini` in the data folder. The in-game overlay (Insert key, or L3+R3
+on a controller) can change the upscaler, sharpening and motion blur while you play.
 
 ### Controls
 
@@ -142,15 +143,14 @@ start without them. Each one can still be overridden. `run.sh` explains each.
 - Only CUSA01073 version 01.00 is tested. The US release and updated versions are not.
 - No one has played the game from start to finish on the port yet.
 - The first visit to each area stutters while shaders compile. Later visits use the cache.
-- 120 FPS and Unlocked are newer than 60 FPS and less tested. If one misbehaves, use 60.
+- 120 FPS is not steady yet: busy scenes run at about 80 FPS on the tested PC. 60 FPS is the
+  recommended preset. Unlocked is less tested still.
 - Don't set `BB_VBLANK_HZ=480`. With very high frame rates at 480 Hz the game has frozen. The
   port uses 240 Hz instead.
 - Occlusion data arrives a frame later than on the PS4 (`BB_READBACK_LINEAR_ASYNC=1`, much faster).
   If you see objects pop in when turning the camera, try `BB_READBACK_LINEAR_ASYNC=0` and report it.
 - On CPUs without AMD's SSE4a instructions (all Intel CPUs) a few game instructions are emulated.
   This is automatic and costs almost nothing.
-- The in-game overlay (Insert) still uses bbport's Bloodborne layout. Many of its options, such as
-  output resolution and FSR 4, do nothing in this game.
 - AMD GPUs run with the same memory model as NVIDIA (`BB_PC_MODEL=0`). bbport's newer model is not
   tested with this game.
 
