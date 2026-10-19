@@ -7,11 +7,13 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <string>
 #include <thread>
 #include <time.h>
 #include <vector>
@@ -242,11 +244,67 @@ public:
         }
         return h[0] ^ std::rotl(h[1], 13) ^ std::rotl(h[2], 29) ^ std::rotl(h[3], 41);
     }
+    /// BB_STALE_REGION=<4 MiB region>: its pages are kept whole at upload, and a stale page
+    /// there prints which bytes changed against the binding's range (first 40).
+    static VAddr StaleRegion() {
+        static const VAddr region = [] {
+            const char* env = std::getenv("BB_STALE_REGION");
+            return env ? VAddr(std::strtoull(env, nullptr, 0)) : VAddr(0);
+        }();
+        return region;
+    }
     void NoteUploaded(VAddr addr, u64 size) {
         std::scoped_lock lk{hash_mutex};
         for (VAddr page = addr & ~VAddr(4095); page < addr + size; page += 4096) {
             page_hashes[page] = PageHash(page);
+            if (StaleRegion() && (page & ~VAddr(TRACKER_HIGHER_PAGE_SIZE - 1)) == StaleRegion()) {
+                auto& copy = page_copies[page];
+                copy.resize(4096);
+                std::memcpy(copy.data(), reinterpret_cast<const void*>(page), 4096);
+            }
         }
+    }
+    void DumpStale(VAddr page, VAddr addr, u64 size, int kind) {
+        static std::atomic<int> printed{0};
+        if ((page & ~VAddr(TRACKER_HIGHER_PAGE_SIZE - 1)) != StaleRegion() ||
+            printed.load(std::memory_order_relaxed) >= 40) {
+            return;
+        }
+        std::scoped_lock lk{hash_mutex};
+        const auto it = page_copies.find(page);
+        if (it == page_copies.end()) {
+            return;
+        }
+        const auto* now = reinterpret_cast<const u8*>(page);
+        std::string runs;
+        size_t inside = 0, outside = 0;
+        for (size_t i = 0; i < 4096;) {
+            if (now[i] == it->second[i]) {
+                ++i;
+                continue;
+            }
+            size_t j = i;
+            while (j < 4096 && now[j] != it->second[j]) {
+                ++j;
+            }
+            const VAddr a = page + i, b = page + j;
+            const bool in = b > addr && a < addr + size;
+            (in ? inside : outside) += j - i;
+            if (runs.size() < 400) {
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), " +%#zx..%#zx%s (%02x->%02x)", i, j,
+                              in ? "" : " out", it->second[i], now[i]);
+                runs += buf;
+            }
+            i = j;
+        }
+        printed.fetch_add(1, std::memory_order_relaxed);
+        std::printf("Stale page %#llx kind %d, binding %#llx+%#llx, %s thread: %zu bytes in "
+                    "range, %zu outside:%s\n",
+                    (unsigned long long)page, kind, (unsigned long long)addr,
+                    (unsigned long long)size,
+                    BbStats::async_required_epoch ? "recording" : "other", inside, outside,
+                    runs.c_str());
     }
     void ForgetUploaded(VAddr addr, u64 size) {
         std::scoped_lock lk{hash_mutex};
@@ -293,6 +351,9 @@ public:
                 kind = tracker->PeekWritten(page, 4096, runs) && !runs.empty() ? 0 : 1;
             }
             BbStats::stale_pages[kind][rec].fetch_add(1, std::memory_order_relaxed);
+            if (StaleRegion()) {
+                DumpStale(page, addr, size, kind);
+            }
             BbStats::NoteStale(page & ~VAddr(TRACKER_HIGHER_PAGE_SIZE - 1), kind, page);
         }
     }
@@ -710,6 +771,7 @@ private:
     std::mutex async_mutex;
     std::mutex hash_mutex;
     std::unordered_map<VAddr, u64> page_hashes;
+    std::unordered_map<VAddr, std::vector<u8>> page_copies;
     std::vector<RegionManager*> async_regions;
     std::atomic<bool> async_regions_changed{false};
     std::jthread async_scanner; ///< last: stopped and joined before the members it reads go
