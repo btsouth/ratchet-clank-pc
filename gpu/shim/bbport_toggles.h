@@ -129,6 +129,8 @@ inline std::atomic<std::uint64_t> async_late_pages{0};
 /// page-protected, no fault came) and thread (0: others, 1: the draw recording thread).
 inline std::atomic<std::uint64_t> stale_checks{0}, stale_sampled{0};
 inline std::atomic<std::uint64_t> stale_pages[3][2]{};
+/// Late stale pages on the draw recording thread by epochs since the packet's (0,1,2-3,4-7,8-15,16-31,32-63,64+).
+inline std::atomic<std::uint64_t> stale_gap[8]{};
 struct StaleRegion {
     std::uint64_t region, pages[3], first[3];
 };

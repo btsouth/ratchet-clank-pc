@@ -682,6 +682,11 @@ void VideoOutDriver::Flip(const Request& req) {
                             double(BbStats::stale_sampled.exchange(0)) / window,
                             p[0][1] / window, p[0][0] / window, p[1][1] / window,
                             p[1][0] / window, p[2][1] / window, p[2][0] / window);
+                std::printf(" late by epochs since the packet's (0,1,2-3,4-7,8-15,16-31,32-63,64+):");
+                for (auto& g : BbStats::stale_gap) {
+                    std::printf(" %llu", (unsigned long long)g.exchange(0));
+                }
+                std::printf(";");
                 std::scoped_lock lk{BbStats::stale_mutex};
                 std::vector<BbStats::StaleRegion> top;
                 for (auto& e : BbStats::stale_table) {

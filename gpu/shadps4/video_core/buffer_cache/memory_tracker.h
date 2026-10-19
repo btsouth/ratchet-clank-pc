@@ -365,6 +365,12 @@ public:
                 kind = tracker->PeekWritten(page, 4096, runs) && !runs.empty() ? 0 : 1;
             }
             BbStats::stale_pages[kind][rec].fetch_add(1, std::memory_order_relaxed);
+            if (kind == 0 && rec) {
+                const u64 gap = BbStats::upload_epoch.load(std::memory_order_relaxed) -
+                                BbStats::async_required_epoch;
+                const int bucket = gap == 0 ? 0 : gap == 1 ? 1 : gap < 4 ? 2 : gap < 8 ? 3 : gap < 16 ? 4 : gap < 32 ? 5 : gap < 64 ? 6 : 7;
+                BbStats::stale_gap[bucket].fetch_add(1, std::memory_order_relaxed);
+            }
             if (StaleRegion()) {
                 DumpStale(page, addr, size, kind);
             }
