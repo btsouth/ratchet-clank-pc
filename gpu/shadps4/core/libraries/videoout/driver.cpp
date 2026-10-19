@@ -651,7 +651,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::printf("Async write tracking: %.0f region scans/s (%.0f/s by the GPU threads, "
                             "%.0f/s by the draw recording thread, %.0f/s of them for its time window, %.0f/s finding late writes, %.0f/s for age), %.1f epochs/frame, %.3f ms/frame scanning, "
                             "%.0f written pages/s, %llu failed scans, %llu entry scans (%llu pages), "
-                            "%llu late pages page-protected\n",
+                            "%llu late pages page-protected, %.0f head scans/s\n",
                             scans / window,
                             double(BbStats::async_inline_scans.exchange(0)) / window,
                             double(BbStats::async_recorder_scans.exchange(0)) / window,
@@ -665,7 +665,8 @@ void VideoOutDriver::Flip(const Request& req) {
                                 BbStats::async_scan_failures.exchange(0)),
                             static_cast<unsigned long long>(BbStats::async_entry_scans.exchange(0)),
                             static_cast<unsigned long long>(BbStats::async_entry_pages.exchange(0)),
-                            static_cast<unsigned long long>(BbStats::async_late_pages.load()));
+                            static_cast<unsigned long long>(BbStats::async_late_pages.load()),
+                            double(BbStats::async_head_scans.exchange(0)) / window);
                 last_epoch = epoch;
             }
             if (const u64 checks = BbStats::stale_checks.exchange(0)) {

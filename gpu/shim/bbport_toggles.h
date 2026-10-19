@@ -121,6 +121,8 @@ inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
 /// Rescans for the time window that found late writes (their region is rescanned for
 /// BB_ASYNC_REC_LATE_MS).
 inline std::atomic<std::uint64_t> async_late_regions{0};
+/// Region scans by the head scanner (MemoryTracker::AsyncHeadScanner).
+inline std::atomic<std::uint64_t> async_head_scans{0};
 /// Pages found written late so far (page-protected from then on; RegionManager::late_pages).
 inline std::atomic<std::uint64_t> async_late_pages{0};
 /// Diagnostics (BB_STALE_VERIFY=1, MemoryTracker::VerifyStale): sampled pages of bindings that

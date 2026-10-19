@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <string>
 #include <thread>
+#include <sys/prctl.h>
 #include <time.h>
 #include <vector>
 #include <x86intrin.h>
@@ -580,6 +581,9 @@ private:
         async_regions_changed.store(true, std::memory_order_release);
         if (!async_scanner.joinable()) {
             async_scanner = std::jthread([this](std::stop_token stop) { AsyncScanner(stop); });
+            if (HeadUs() != 0) {
+                async_head = std::jthread([this](std::stop_token stop) { AsyncHeadScanner(stop); });
+            }
         }
     }
 
@@ -588,6 +592,89 @@ private:
     /// BB_ASYNC_WP_US besides (writes the guest makes without a submission in between are then
     /// seen within about that time too). A scan costs mostly per ioctl (~1 us), little per page
     /// (~0.3 ns), so adjacent regions are scanned together, with their locks held.
+    /// bbport (async write tracking): Ratchet & Clank writes data for draws it has already
+    /// submitted, a few submissions later (the PS4's GPU is that far behind). A write fault saw
+    /// such a write up to the draw's binding; a scan, only if it came after the write. The
+    /// regions the guest wrote in the last BB_ASYNC_HEAD_MS (50) are scanned every
+    /// BB_ASYNC_HEAD_US (50; 0: off) on this thread, so the draw recording thread finds them
+    /// scanned within its time window (BB_ASYNC_REC_US) without scanning them itself.
+    static u64 HeadUs() {
+        static const u64 us = [] {
+            const char* env = std::getenv("BB_ASYNC_HEAD_US");
+            return env ? std::strtoull(env, nullptr, 10) : 50ull;
+        }();
+        return us;
+    }
+    void AsyncHeadScanner(std::stop_token stop) {
+        Common::SetCurrentThreadName("bb:AsyncHead");
+        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+        const u64 head_ticks = RecorderTicks("BB_ASYNC_HEAD_MS", 50.0);
+        const timespec pause{0, s64(HeadUs()) * 1000};
+        std::vector<RegionManager*> regions, group, active;
+        std::vector<std::pair<VAddr, VAddr>> runs;
+        while (!stop.stop_requested()) {
+            nanosleep(&pause, nullptr);
+            if (BbStats::async_scanner_idle.load(std::memory_order_relaxed) &&
+                BbStats::frame_number.load(std::memory_order_relaxed) == 0) {
+                continue;
+            }
+            {
+                std::scoped_lock lk{async_mutex};
+                regions = async_regions;
+            }
+            std::sort(regions.begin(), regions.end(),
+                      [](auto* a, auto* b) { return a->GetCpuAddr() < b->GetCpuAddr(); });
+            const u64 now = __rdtsc();
+            const u64 epoch = BbStats::upload_epoch.load(std::memory_order_seq_cst);
+            const auto scan_group = [&] {
+                for (auto* manager : group) {
+                    manager->lock.lock();
+                }
+                active.clear();
+                for (auto* manager : group) {
+                    if (manager->BeginAsyncScan(epoch, now)) {
+                        active.push_back(manager);
+                    }
+                }
+                if (!active.empty()) {
+                    runs.clear();
+                    const VAddr from = active.front()->GetCpuAddr();
+                    const VAddr to = active.back()->GetCpuAddr() + TRACKER_HIGHER_PAGE_SIZE;
+                    const u64 t0 = __rdtsc();
+                    const bool ok = tracker->ScanWritten(from, to - from, runs);
+                    BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
+                    BbStats::async_head_scans.fetch_add(active.size(), std::memory_order_relaxed);
+                    BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+                    for (auto* manager : active) {
+                        if (ok) {
+                            manager->FinishAsyncScan(runs, epoch, now);
+                        } else {
+                            manager->ScanAsyncWrites(epoch, now);
+                        }
+                    }
+                }
+                for (auto* manager : group) {
+                    manager->lock.unlock();
+                }
+                group.clear();
+            };
+            for (auto* manager : regions) {
+                if (now - std::min(now, manager->AsyncWriteTsc()) >= head_ticks) {
+                    continue;
+                }
+                if (!group.empty() && (group.size() == 64 || group.back()->GetCpuAddr() +
+                                                                     TRACKER_HIGHER_PAGE_SIZE !=
+                                                                 manager->GetCpuAddr())) {
+                    scan_group();
+                }
+                group.push_back(manager);
+            }
+            if (!group.empty()) {
+                scan_group();
+            }
+        }
+    }
+
     void AsyncScanner(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:AsyncScan");
         // Regions used in the last two frames: the next submissions use them too. Passes come
@@ -794,6 +881,7 @@ private:
     std::unordered_map<VAddr, std::vector<u8>> page_copies;
     std::vector<RegionManager*> async_regions;
     std::atomic<bool> async_regions_changed{false};
+    std::jthread async_head;
     std::jthread async_scanner; ///< last: stopped and joined before the members it reads go
 };
 
