@@ -412,7 +412,11 @@ private:
                 any = true;
             }
             cpu |= hit;
-            if (late) {
+            static const bool protect_late = [] {
+                const char* env = std::getenv("BB_ASYNC_LATE_PROTECT");
+                return !(env && env[0] == '0');
+            }();
+            if (late && protect_late) {
                 for (const auto& [a, b] : RegionBits(hit & ~late_pages)) {
                     BbStats::async_late_pages.fetch_add(b - a, std::memory_order_relaxed);
                 }
