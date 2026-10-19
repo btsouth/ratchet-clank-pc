@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -54,6 +57,24 @@ public:
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// bbport: async write tracking (userfaultfd WP_ASYNC + PAGEMAP_SCAN, BB_ASYNC_WP=0: off).
+    /// Buffer pages the GPU did not write are not page-protected: a guest write to them costs
+    /// nothing when it happens, and the GPU side asks which pages were written (ScanWritten)
+    /// before it relies on its copies. Images and GPU-written pages keep page protection.
+    [[nodiscard]] bool AsyncWrites() const noexcept {
+        return async != nullptr;
+    }
+    /// Changes whenever GPU memory is registered or unregistered for async tracking.
+    [[nodiscard]] u64 AsyncGeneration() const noexcept;
+    /// Whether all of [addr, addr + size) is registered for async tracking.
+    [[nodiscard]] bool AsyncCovered(VAddr addr, u64 size) const;
+    /// Appends the runs of pages in [addr, addr + size) written since they were last scanned and
+    /// protects them again (one ioctl). False: the scan failed, every page counts as written.
+    bool ScanWritten(VAddr addr, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs) const;
+    /// TSC ticks after which a region is scanned again even without a new guest submission or
+    /// wait (BB_ASYNC_WP_US, default 4000 us; 0: only then).
+    [[nodiscard]] u64 AsyncMaxAgeTicks() const noexcept;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);
@@ -69,6 +90,8 @@ private:
     friend struct SignalImpl;
     struct Impl;
     std::unique_ptr<Impl> impl;
+    struct AsyncWp;
+    std::unique_ptr<AsyncWp> async;
 };
 
 } // namespace VideoCore

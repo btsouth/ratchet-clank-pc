@@ -19,6 +19,9 @@
 #include <cstdio>
 #include <sys/uio.h>
 #include <dlfcn.h>
+#include <boost/icl/interval_set.hpp>
+#include <chrono>
+#include <x86intrin.h>
 #include <string>
 #include <fmt/format.h>
 #include <ucontext.h>
@@ -45,7 +48,9 @@
 #include <limits>
 #include <mutex>
 #include <unistd.h>
+#include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #else
 #include "common/spin_lock.h"
@@ -716,6 +721,220 @@ struct SignalImpl : public PageManager::Impl {
 
 };
 
+#ifdef __linux__
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+#ifndef PAGEMAP_SCAN
+// Linux 6.7 (older kernel headers): fs/proc/task_mmu.c's scan of written pages.
+struct page_region {
+    __u64 start, end, categories;
+};
+struct pm_scan_arg {
+    __u64 size, flags, start, end, walk_end, vec, vec_len, max_pages, category_inverted,
+        category_mask, category_anyof_mask, return_mask;
+};
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#define PAGE_IS_WRITTEN (1 << 1)
+#define PM_SCAN_WP_MATCHING (1 << 0)
+#define PM_SCAN_CHECK_WPASYNC (1 << 1)
+#endif
+
+// bbport: async write tracking. With UFFD_FEATURE_WP_ASYNC a write to a write-protected page
+// does not fault into a handler: the kernel lifts the protection itself and the page counts as
+// written until PAGEMAP_SCAN with PM_SCAN_WP_MATCHING reports it and protects it again, in one
+// ioctl for a whole range. The game's per-frame buffers (Ratchet & Clank's geometry ring:
+// 9-16k faults/s, ~15 thread-ms per frame in fault handlers plus ~5 ms of mprotect, each fault
+// also draining the draw pipe) then cost a scan per 4 MiB region when the GPU side next needs
+// them. GPU memory is registered and protected once when it is mapped; scans re-protect what
+// they report, so pages are never protected one by one. Pages under images and pages the GPU
+// wrote stay protected with mprotect (RegionManager): a write there must still be seen at
+// once (texture invalidation, a readback of the GPU's data before the guest's bytes land).
+struct PageManager::AsyncWp {
+    int uffd = -1;
+    int pagemap = -1;
+    u64 max_age_ticks = 0;
+    mutable std::mutex mutex;
+    boost::icl::interval_set<VAddr> registered;
+    std::atomic<u64> generation{1};
+
+    ~AsyncWp() {
+        if (pagemap >= 0) {
+            close(pagemap);
+        }
+        if (uffd >= 0) {
+            close(uffd);
+        }
+    }
+
+    static std::unique_ptr<AsyncWp> Create() {
+        const char* env = std::getenv("BB_ASYNC_WP");
+        if ((env && env[0] == '0') || !VideoCore::WriteTracking()) {
+            return nullptr;
+        }
+        auto wp = std::make_unique<AsyncWp>();
+        wp->uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        if (wp->uffd < 0) {
+            std::printf("GPU: async write tracking unavailable (userfaultfd: %s)\n",
+                        Common::GetLastErrorMsg().c_str());
+            return nullptr;
+        }
+        uffdio_api api{};
+        api.api = UFFD_API;
+        api.features =
+            UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
+        if (ioctl(wp->uffd, UFFDIO_API, &api) != 0) {
+            std::printf("GPU: async write tracking unavailable (kernel before 6.7: %s)\n",
+                        Common::GetLastErrorMsg().c_str());
+            return nullptr;
+        }
+        wp->pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        if (wp->pagemap < 0 || !wp->SelfTest()) {
+            std::printf("GPU: async write tracking unavailable (PAGEMAP_SCAN)\n");
+            return nullptr;
+        }
+        // Region scans are timed with the TSC (a clock read per buffer binding is too much).
+        const auto t0 = std::chrono::steady_clock::now();
+        const u64 c0 = __rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const u64 c1 = __rdtsc();
+        const double ns = std::chrono::duration<double, std::nano>(
+                              std::chrono::steady_clock::now() - t0).count();
+        const char* age = std::getenv("BB_ASYNC_WP_US");
+        const double us = age ? std::strtod(age, nullptr) : 4000.0;
+        BbStats::async_tsc_per_ms.store(std::max<u64>(1, u64(double(c1 - c0) * 1e6 / ns)));
+        wp->max_age_ticks = us > 0 ? u64(us * 1000.0 * double(c1 - c0) / ns) : ~0ull;
+        BbStats::async_write_tracking.store(true, std::memory_order_relaxed);
+        std::printf("GPU: async write tracking (userfaultfd async write-protect, PAGEMAP_SCAN; "
+                    "BB_ASYNC_WP=0: page faults)\n");
+        return wp;
+    }
+
+    /// A shared memfd page like guest memory: protected, written, then found by one scan.
+    bool SelfTest() {
+        const int fd = memfd_create("bb-async-wp-test", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, 2 * PM_PAGE_SIZE) != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            return false;
+        }
+        auto* page = static_cast<u8*>(
+            mmap(nullptr, 2 * PM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        close(fd);
+        if (page == MAP_FAILED) {
+            return false;
+        }
+        const VAddr addr = reinterpret_cast<VAddr>(page);
+        bool ok = Register(addr, 2 * PM_PAGE_SIZE);
+        if (ok) {
+            page[PM_PAGE_SIZE] = 1;
+            std::vector<std::pair<VAddr, VAddr>> runs;
+            ok = Scan(addr, 2 * PM_PAGE_SIZE, runs) && runs.size() == 1 &&
+                 runs[0].first == addr + PM_PAGE_SIZE && runs[0].second == addr + 2 * PM_PAGE_SIZE;
+            runs.clear();
+            ok = ok && Scan(addr, 2 * PM_PAGE_SIZE, runs) && runs.empty();
+            uffdio_range range{addr, 2 * PM_PAGE_SIZE};
+            ioctl(uffd, UFFDIO_UNREGISTER, &range);
+        }
+        munmap(page, 2 * PM_PAGE_SIZE);
+        return ok;
+    }
+
+    bool Register(VAddr address, u64 size) {
+        uffdio_register reg{};
+        reg.range.start = address;
+        reg.range.len = size;
+        reg.mode = UFFDIO_REGISTER_MODE_WP;
+        if (ioctl(uffd, UFFDIO_REGISTER, &reg) != 0) {
+            return false;
+        }
+        // Protected once: written pages are protected again by the scans that report them.
+        uffdio_writeprotect wp{};
+        wp.range.start = address;
+        wp.range.len = size;
+        wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+        if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) != 0) {
+            uffdio_range range{address, size};
+            ioctl(uffd, UFFDIO_UNREGISTER, &range);
+            return false;
+        }
+        return true;
+    }
+
+    void Map(VAddr address, u64 size) {
+        const bool ok = Register(address, size);
+        std::scoped_lock lk{mutex};
+        const auto range = boost::icl::interval<VAddr>::right_open(address, address + size);
+        if (ok) {
+            registered += range;
+        } else {
+            registered -= range;
+            LOG_WARNING(Render, "Async write tracking: registering {:#x}+{:#x} failed: {}",
+                        address, size, Common::GetLastErrorMsg());
+        }
+        generation.fetch_add(1, std::memory_order_release);
+    }
+
+    void Unmap(VAddr address, u64 size) {
+        {
+            std::scoped_lock lk{mutex};
+            registered -= boost::icl::interval<VAddr>::right_open(address, address + size);
+            generation.fetch_add(1, std::memory_order_release);
+        }
+        // Usually gone already (the hook runs after the runtime's munmap).
+        uffdio_range range{address, size};
+        ioctl(uffd, UFFDIO_UNREGISTER, &range);
+    }
+
+    bool Covered(VAddr address, u64 size) const {
+        std::scoped_lock lk{mutex};
+        return boost::icl::contains(registered,
+                                    boost::icl::interval<VAddr>::right_open(address, address + size));
+    }
+
+    bool Scan(VAddr address, u64 size, std::vector<std::pair<VAddr, VAddr>>& runs) const {
+        std::array<page_region, 64> regions;
+        pm_scan_arg arg{};
+        arg.size = sizeof(arg);
+        // A range that is not registered any more fails the scan (the caller counts it all as
+        // written) instead of being skipped.
+        arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+        arg.end = address + size;
+        arg.vec = reinterpret_cast<u64>(regions.data());
+        arg.vec_len = regions.size();
+        arg.category_mask = PAGE_IS_WRITTEN;
+        arg.return_mask = PAGE_IS_WRITTEN;
+        for (VAddr at = address; at < address + size;) {
+            arg.start = at;
+            arg.walk_end = 0;
+            const long n = ioctl(pagemap, PAGEMAP_SCAN, &arg);
+            if (n < 0) {
+                return false;
+            }
+            for (long i = 0; i < n; ++i) {
+                if (!runs.empty() && runs.back().second == regions[i].start) {
+                    runs.back().second = regions[i].end;
+                } else {
+                    runs.emplace_back(regions[i].start, regions[i].end);
+                }
+            }
+            if (arg.walk_end <= at) {
+                return false;
+            }
+            at = arg.walk_end;
+        }
+        return true;
+    }
+};
+#else
+struct PageManager::AsyncWp {
+    static std::unique_ptr<AsyncWp> Create() {
+        return nullptr;
+    }
+};
+#endif
+
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__
     // bbport: dma-buf guest memory (BB_GUEST_GPU_MEMORY=1) cannot be write-protected by userfaultfd
@@ -734,6 +953,9 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
         }
     }
     LOG_INFO(Config, "Memory tracking method: signals");
+    if (!dma_buf_guest) {
+        async = AsyncWp::Create();
+    }
 #endif
     impl = std::make_unique<SignalImpl>(rasterizer_);
 }
@@ -742,10 +964,53 @@ PageManager::~PageManager() = default;
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);
+#ifdef __linux__
+    if (async) {
+        async->Map(address, size);
+    }
+#endif
 }
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+#ifdef __linux__
+    if (async) {
+        async->Unmap(address, size);
+    }
+#endif
+}
+
+u64 PageManager::AsyncGeneration() const noexcept {
+#ifdef __linux__
+    return async ? async->generation.load(std::memory_order_acquire) : 0;
+#else
+    return 0;
+#endif
+}
+
+bool PageManager::AsyncCovered(VAddr addr, u64 size) const {
+#ifdef __linux__
+    return async && async->Covered(addr, size);
+#else
+    return false;
+#endif
+}
+
+bool PageManager::ScanWritten(VAddr addr, u64 size,
+                              std::vector<std::pair<VAddr, VAddr>>& runs) const {
+#ifdef __linux__
+    return async && async->Scan(addr, size, runs);
+#else
+    return false;
+#endif
+}
+
+u64 PageManager::AsyncMaxAgeTicks() const noexcept {
+#ifdef __linux__
+    return async ? async->max_age_ticks : ~0ull;
+#else
+    return ~0ull;
+#endif
 }
 
 template <bool track>

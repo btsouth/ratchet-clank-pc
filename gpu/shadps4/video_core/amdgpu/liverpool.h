@@ -117,6 +117,8 @@ public:
 
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
+    /// bbport (async write tracking): a guest submission starts a new upload epoch.
+    static void NoteGuestSubmit();
 
     /// `frame` (BB_SUBMIT_LOCK=frame): the guest's frame number, reported finished once the GPU
     /// has executed what was submitted until now on every queue, compute queues too (the game

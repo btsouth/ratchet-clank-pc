@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "bbport_threads.h"
+#include "bbport_toggles.h"
 #include "bbport_sections.h"
 
 #include <array>
@@ -79,7 +80,9 @@ public:
 
     /// Stage A: hands the packet from Begin() to stage B.
     void Commit(u32 payload_size) {
-        reinterpret_cast<Header*>(ring.get() + head % Capacity)->payload = payload_size;
+        auto* header = reinterpret_cast<Header*>(ring.get() + head % Capacity);
+        header->payload = payload_size;
+        header->epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
         head += pending_size;
         published.store(head, std::memory_order_seq_cst);
         ++packets;
@@ -181,6 +184,7 @@ private:
     struct Header {
         u32 size;    ///< bytes to the next packet (0: wrap to the ring start)
         u32 payload; ///< bytes written by the producer
+        u64 epoch;   ///< BbStats::upload_epoch when stage A committed it
     };
     static constexpr u64 Capacity = 16ull << 20;
 
@@ -238,6 +242,9 @@ private:
                 continue;
             }
             const u64 start = __rdtsc();
+            // Async write tracking: the packet reads what the guest wrote before stage A
+            // decoded it (MemoryTracker::SyncAsyncWrites).
+            BbStats::async_required_epoch = header->epoch;
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
