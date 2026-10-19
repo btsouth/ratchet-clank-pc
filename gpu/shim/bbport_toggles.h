@@ -130,11 +130,11 @@ inline std::atomic<std::uint64_t> async_late_pages{0};
 inline std::atomic<std::uint64_t> stale_checks{0}, stale_sampled{0};
 inline std::atomic<std::uint64_t> stale_pages[3][2]{};
 struct StaleRegion {
-    std::uint64_t region, pages[3];
+    std::uint64_t region, pages[3], first[3];
 };
 inline std::mutex stale_mutex;
 inline StaleRegion stale_table[128];
-inline void NoteStale(std::uint64_t region, int kind) {
+inline void NoteStale(std::uint64_t region, int kind, std::uint64_t page) {
     std::scoped_lock lk{stale_mutex};
     StaleRegion* slot = &stale_table[(region >> 22) % 128];
     for (auto& e : stale_table) {
@@ -144,7 +144,10 @@ inline void NoteStale(std::uint64_t region, int kind) {
         }
     }
     if (slot->region != region) {
-        *slot = {region, {}};
+        *slot = {region, {}, {}};
+    }
+    if (!slot->pages[kind]) {
+        slot->first[kind] = page;
     }
     ++slot->pages[kind];
 }

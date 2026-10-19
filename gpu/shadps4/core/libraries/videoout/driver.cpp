@@ -695,9 +695,11 @@ void VideoOutDriver::Flip(const Request& req) {
                 });
                 top.resize(std::min<size_t>(top.size(), 10));
                 for (const auto& t : top) {
-                    std::printf(" %#llx:%llu/%llu/%llu", (unsigned long long)t.region,
-                                (unsigned long long)t.pages[0], (unsigned long long)t.pages[1],
-                                (unsigned long long)t.pages[2]);
+                    std::printf(" %#llx:%llu/%llu/%llu (first %#llx/%#llx/%#llx)",
+                                (unsigned long long)t.region, (unsigned long long)t.pages[0],
+                                (unsigned long long)t.pages[1], (unsigned long long)t.pages[2],
+                                (unsigned long long)t.first[0], (unsigned long long)t.first[1],
+                                (unsigned long long)t.first[2]);
                 }
                 std::printf("\n");
             }
