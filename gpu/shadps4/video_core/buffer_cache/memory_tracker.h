@@ -57,7 +57,8 @@ public:
     /// packets carry the epoch they were decoded in). The scanner thread scans the regions in use
     /// as soon as the epoch changes, and every BB_ASYNC_WP_US besides; the caller scans the ones
     /// it did not get to yet.
-    void SyncAsyncWrites(VAddr query_cpu_addr, u64 query_size, bool keep_scanned = true) {
+    void SyncAsyncWrites(VAddr query_cpu_addr, u64 query_size, bool keep_scanned = true,
+                         bool force = false) {
         if (!tracker->AsyncWrites() || query_size == 0) {
             return;
         }
@@ -68,7 +69,7 @@ public:
             return env ? std::atoi(env) : 0;
         }();
         const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
-        const u64 required = diag == 1 ? ~0ull
+        const u64 required = diag == 1 || force ? ~0ull
                              : BbStats::async_required_epoch && diag != 2
                                  ? BbStats::async_required_epoch
                                  : epoch;
@@ -271,7 +272,10 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
-        SyncAsyncWrites(query_cpu_range, query_size);
+        // A GPU write binding scans its pages whatever their epoch: once the GPU owns them they
+        // are page-protected and left out of scans, so a guest write before it not reported yet
+        // would never be uploaded (a write fault saw it before the binding).
+        SyncAsyncWrites(query_cpu_range, query_size, true, is_written);
         VerifyAsyncWrites(query_cpu_range, query_size);
         // bbport: a write binding over pages the CPU did not change and the GPU already owns
         // needs neither an upload nor a state change (it ran under the region lock for every
