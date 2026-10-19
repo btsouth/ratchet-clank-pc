@@ -497,6 +497,21 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
 // (BB_HONEST_LABELS), as the command processor gives it when it gets there: signalled when decoded
 // (a frame ahead of the GPU), a queue waiting on it would read what that work had not written
 // yet. BB_MEM_SEMAPHORE_ORDER=0: when decoded (as before).
+// bbport (async write tracking): a wait for the guest (a MEM_SEMAPHORE it signals, a REWIND it
+// marks valid) lets the work after it read what the guest wrote before releasing it, as a met
+// WAIT_REG_MEM does: a new upload epoch, so that work sees a scan made after the release.
+// BB_SYNC_EPOCHS=0: off (A/B). `waited`: the wait was not met when decoded.
+void NoteGuestRelease(int kind, bool waited) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_SYNC_EPOCHS");
+        return !(env && env[0] == '0');
+    }();
+    BbStats::guest_releases[kind][waited].fetch_add(1, std::memory_order_relaxed);
+    if (on) {
+        BbStats::NewUploadEpoch();
+    }
+}
+
 bool MemSemaphoreInOrder() {
     static const bool on = [] {
         const char* env = std::getenv("BB_MEM_SEMAPHORE_ORDER");
@@ -2142,6 +2157,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         mem_semaphore->Signal();
                     }
                 } else {
+                    const bool waited = !mem_semaphore->Signaled();
                     while (!mem_semaphore->Signaled()) {
                         // A signal in stream order may wait for work still in the draw pipe or
                         // not submitted yet; this thread would spin on it forever.
@@ -2155,6 +2171,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
+                    NoteGuestRelease(0, waited);
                 }
                 break;
             }
@@ -2167,9 +2184,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                const bool waited = !rewind->Valid();
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
+                NoteGuestRelease(1, waited);
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
@@ -2497,9 +2516,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            const bool waited = !rewind->Valid();
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
+            NoteGuestRelease(1, waited);
             break;
         }
         case PM4ItOpcode::SetShReg: {
@@ -2608,6 +2629,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     mem_semaphore->Signal();
                 }
             } else {
+                const bool waited = !mem_semaphore->Signaled();
                 while (!mem_semaphore->Signaled()) {
                     if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
                         rasterizer->Flush();
@@ -2615,6 +2637,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
+                NoteGuestRelease(0, waited);
             }
             break;
         }

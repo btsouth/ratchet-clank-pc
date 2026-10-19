@@ -121,6 +121,8 @@ inline std::atomic<std::uint64_t> async_window_scans{0}, async_entry_scans{0},
 /// Rescans for the time window that found late writes (their region is rescanned for
 /// BB_ASYNC_REC_LATE_MS).
 inline std::atomic<std::uint64_t> async_late_regions{0};
+/// Waits for the guest that start an upload epoch: MEM_SEMAPHORE, REWIND; met when decoded or waited.
+inline std::atomic<std::uint64_t> guest_releases[2][2]{};
 /// Region scans by the head scanner (MemoryTracker::AsyncHeadScanner).
 inline std::atomic<std::uint64_t> async_head_scans{0};
 /// Pages found written late so far (page-protected from then on; RegionManager::late_pages).
