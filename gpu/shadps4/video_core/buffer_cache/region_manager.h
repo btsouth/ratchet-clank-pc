@@ -303,6 +303,9 @@ public:
     void NoteAsyncLateWrite(u64 now) noexcept {
         late_tsc.store(now, std::memory_order_relaxed);
     }
+    /// With the lock held: the scans coming are for the draw recording thread's time window
+    /// (MemoryTracker::SyncAsyncWrites): the writes they find are late writes.
+    bool late_scan = false;
     /// The GPU side used the region in `epoch`: the scanner thread keeps it scanned (true: it
     /// was not on its list).
     bool NoteAsyncUse(u64 epoch) noexcept {
@@ -334,7 +337,7 @@ public:
     void ScanAsyncWrites(u64 epoch, u64 now) {
         // Fresh only once the written pages are marked (a thread that finds it fresh reads the
         // CPU bits without the lock).
-        ScanAsyncWritesNow();
+        ScanAsyncWritesNow(late_scan);
         scan_tsc.store(now, std::memory_order_relaxed);
         scan_epoch.store(epoch, std::memory_order_release);
     }
@@ -352,7 +355,7 @@ public:
     }
     /// After BeginAsyncScan returned true: `runs` are the written pages of a scan covering it.
     void FinishAsyncScan(const std::vector<std::pair<VAddr, VAddr>>& runs, u64 epoch, u64 now) {
-        MarkAsyncWritten(~writeable & ~sync, runs);
+        MarkAsyncWritten(~writeable & ~sync, runs, late_scan);
         scan_tsc.store(now, std::memory_order_relaxed);
         scan_epoch.store(epoch, std::memory_order_release);
     }
@@ -360,7 +363,7 @@ public:
     LockType lock;
 
 private:
-    void ScanAsyncWritesNow() {
+    void ScanAsyncWritesNow(bool late = false) {
         RefreshAsyncCoverage();
         const RegionBits async_pages = ~writeable & ~sync;
         if (async_pages.None()) {
@@ -380,12 +383,14 @@ private:
         }
         BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
         BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
-        MarkAsyncWritten(async_pages, runs);
+        MarkAsyncWritten(async_pages, runs, late);
     }
 
-    /// Pages of `async_pages` within `runs` (written pages) become CPU-modified.
+    /// Pages of `async_pages` within `runs` (written pages) become CPU-modified. `late`: found
+    /// by a rescan for the draw recording thread's time window (written after the submission
+    /// that reads them): they get page protection from now on (UpdateWriteProtection).
     u64 MarkAsyncWritten(const RegionBits& async_pages,
-                         const std::vector<std::pair<VAddr, VAddr>>& runs) {
+                         const std::vector<std::pair<VAddr, VAddr>>& runs, bool late = false) {
         bool any = false;
         u64 marked = 0;
         for (const auto& [from, to] : runs) {
@@ -407,6 +412,12 @@ private:
                 any = true;
             }
             cpu |= hit;
+            if (late) {
+                for (const auto& [a, b] : RegionBits(hit & ~late_pages)) {
+                    BbStats::async_late_pages.fetch_add(b - a, std::memory_order_relaxed);
+                }
+                late_pages |= hit;
+            }
             for (const auto& [a, b] : hit) {
                 BbStats::async_written_pages.fetch_add(b - a, std::memory_order_relaxed);
                 marked += b - a;
@@ -454,12 +465,15 @@ private:
 
     /// bbport (async write tracking): protected pages (no CPU modification) are page-protected
     /// (`sync`) where a write must be seen when it happens: pages the GPU wrote (their data is
-    /// read back before the guest's bytes land) and memory not registered for async tracking.
+    /// read back before the guest's bytes land), pages the guest writes late (after the
+    /// submission that reads them: a scan in between may come too early, a write fault does not)
+    /// and memory not registered for async tracking.
     /// The others are left writable and found by ScanAsyncWrites. Pages under images get page
     /// protection from the texture cache's own watchers.
     void UpdateWriteProtection() {
         const RegionBits protected_pages = ~cpu;
-        const RegionBits want_sync = async_covered ? (protected_pages & gpu) : protected_pages;
+        const RegionBits want_sync =
+            async_covered ? (protected_pages & (gpu | late_pages)) : protected_pages;
         const RegionBits was_async = ~writeable & ~sync;
         writeable = cpu;
         RegionBits add = want_sync & ~sync;
@@ -657,6 +671,9 @@ private:
     /// bbport (async write tracking): pages with page protection from this region (the other
     /// protected ones are found by scans).
     RegionBits sync;
+    /// Pages a rescan for the draw recording thread's time window found written (late writes):
+    /// page-protected from then on.
+    RegionBits late_pages{};
     std::atomic<u64> scan_epoch{0}, scan_tsc{0}, write_tsc{0}, late_tsc{0};
     std::atomic<u64> use_epoch{0};
     std::atomic<bool> async_listed{false};

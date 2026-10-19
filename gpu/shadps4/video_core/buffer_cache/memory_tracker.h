@@ -102,9 +102,11 @@ public:
                 write_before[i] = recorder && run[i]->AsyncFresh(required)
                                       ? run[i]->AsyncWriteTsc()
                                       : ~0ull;
+                run[i]->late_scan = write_before[i] != ~0ull;
             }
             ScanRegions({run.data(), run_size}, fresh);
             for (size_t i = 0; i < run_size; ++i) {
+                run[i]->late_scan = false;
                 if (write_before[i] != ~0ull && run[i]->AsyncWriteTsc() != write_before[i]) {
                     run[i]->NoteAsyncLateWrite(now);
                     BbStats::async_late_regions.fetch_add(1, std::memory_order_relaxed);
