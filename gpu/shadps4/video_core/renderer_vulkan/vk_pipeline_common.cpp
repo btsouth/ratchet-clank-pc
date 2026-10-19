@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -12,6 +14,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+#include "bbport_toggles.h"
 
 namespace Vulkan {
 
@@ -25,6 +29,92 @@ Pipeline::~Pipeline() = default;
 
 std::atomic<u64> g_bb_pipeline_wait_ns;
 std::atomic<u64> g_bb_compile_stall_ns;
+std::atomic<u64> g_bb_pipeline_skipped_draws;
+
+namespace {
+u64 EnvNumber(const char* name, u64 fallback) {
+    const char* env = std::getenv(name);
+    return env && *env ? std::strtoull(env, nullptr, 10) : fallback;
+}
+
+/// The time draws spent waiting for pipelines, on all recording threads together, since the
+/// current shown frame (BbStats::frame_number) began, or since RenewAfter with no frame shown
+/// (offscreen work while loading gets a budget too, not only the frame it began in).
+struct DrawWaitBudget {
+    static constexpr auto RenewAfter = std::chrono::milliseconds(500);
+    std::mutex mutex;
+    u32 frame = ~0u;
+    std::chrono::steady_clock::time_point since{};
+    u64 used_ns = 0;
+
+    u64 Used(u32 shown) {
+        std::scoped_lock lk{mutex};
+        const auto now = std::chrono::steady_clock::now();
+        // A recorder that read an older frame number does not take the budget back to it.
+        if (s32(shown - frame) > 0 || frame == ~0u || now - since >= RenewAfter) {
+            frame = s32(shown - frame) > 0 || frame == ~0u ? shown : frame;
+            since = now;
+            used_ns = 0;
+        }
+        return used_ns;
+    }
+    void Charge(u64 ns) {
+        std::scoped_lock lk{mutex};
+        used_ns += ns;
+    }
+};
+DrawWaitBudget draw_wait_budget;
+} // namespace
+
+vk::Pipeline Pipeline::HandleForDrawSlow(bool recurring) const {
+    // Geometry of a pass drawn every frame shows a frame later; a one-time render or a
+    // full-screen pass that goes without leaves a hole or a grey frame, so those wait longer.
+    // The longer budget keeps the frame's flip well inside LBP3's watchdog (5 waits of 100 ms
+    // for the previous frame's flip), which a cold cache missed: ~100 pipelines in one frame
+    // at 50-140 ms each on NVIDIA.
+    static const u64 recurring_ns = EnvNumber("BB_PIPELINE_WAIT_MS", 8) * 1'000'000;
+    static const u64 other_ns = EnvNumber("BB_PIPELINE_STALL_MS", 120) * 1'000'000;
+    static const u64 max_frames = EnvNumber("BB_PIPELINE_SKIP_FRAMES", 60);
+    const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+    bool overdue;
+    {
+        std::scoped_lock lk{handle_mutex};
+        if (!handle_pending.load(std::memory_order_acquire)) {
+            return *pipeline;
+        }
+        if (missing_frame != shown) {
+            missing_frame = shown;
+            ++missing_frames;
+        }
+        overdue = missing_frames > max_frames;
+    }
+    // It may be queued behind a hundred others: the next free worker takes it.
+    Expedite();
+    // Missing for long: waited for like a one-time draw, even if it is geometry.
+    const u64 budget = recurring && !overdue ? recurring_ns : other_ns;
+    const u64 used = draw_wait_budget.Used(shown);
+    if (used >= budget) {
+        g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock lk{handle_mutex};
+    const bool ready =
+        handle_cv.wait_for(lk, std::chrono::nanoseconds(budget - used),
+                           [&] { return !handle_pending.load(std::memory_order_acquire); });
+    lk.unlock();
+    const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    draw_wait_budget.Charge(ns);
+    g_bb_pipeline_wait_ns += ns;
+    g_bb_compile_stall_ns += ns;
+    if (!ready) {
+        g_bb_pipeline_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    return *pipeline;
+}
 
 void Pipeline::WaitHandle() const {
     const auto start = std::chrono::steady_clock::now();

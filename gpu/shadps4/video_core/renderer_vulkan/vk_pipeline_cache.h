@@ -99,6 +99,11 @@ struct PipelineSelection {
     bool motion = false;
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
+    /// bbport: graphics stages on the GPU thread may leave a shader untranslated once the shown
+    /// frame's translation budget is spent (`translation_deferred` then set, the draw left out).
+    bool may_defer_translation = false;
+    bool translation_deferred = false;
+    bool recurring = false; ///< PipelineCache::RecurringDraw, for the translation budget
 };
 
 /// bbport: a draw-preparation worker's own program state (see vk_draw_prep.h).
@@ -152,6 +157,11 @@ public:
     }
 
     const ComputePipeline* GetComputePipeline();
+
+    /// bbport: whether a draw with `regs` is geometry of a pass drawn every frame, which may go
+    /// a frame without its pipeline sooner than other draws (Pipeline::HandleForDraw). Per
+    /// thread: call it for every draw recorded on that thread.
+    static bool RecurringDraw(const AmdGpu::Regs& regs, bool indirect);
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;

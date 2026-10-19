@@ -35,5 +35,19 @@ int main(void) {
     uint64_t cs_param=0x80000; int64_t update=-1; uint32_t index=UINT32_MAX;
     assert(!cs_init(&cs_param) && !cs_update(&update) && !cs_index(&index));
     assert(update==0 && index==0);
-    puts("optional services: scheduler round-trip, trophy bit/count and content search contracts passed");
+    int32_t (ABI *sd_init)(void)=(int32_t (ABI *)(void))runtime_services_resolve("s9e3+YpRnzw#d#e");
+    int32_t (ABI *sd_open)(const void*)=(int32_t (ABI *)(const void*))runtime_services_resolve("4tPhsP6FpDI#d#e");
+    int32_t (ABI *sd_result)(int32_t*)=(int32_t (ABI *)(int32_t*))runtime_services_resolve("yEiJ-qqr6Cg#d#e");
+    int32_t (ABI *sd_ready)(void)=(int32_t (ABI *)(void))runtime_services_resolve("en7gNVnh878#d#e");
+    int32_t (ABI *sd_close)(const void*)=(int32_t (ABI *)(const void*))runtime_services_resolve("fH46Lag88XY#d#e");
+    int32_t (ABI *sd_progress)(int32_t,uint32_t)=(int32_t (ABI *)(int32_t,uint32_t))runtime_services_resolve("hay1CfTmLyA#d#e");
+    int32_t (ABI *sd_term)(void)=(int32_t (ABI *)(void))runtime_services_resolve("YuH2FA7azqQ#d#e");
+    assert(sd_init && sd_open && sd_result && sd_ready && sd_close && sd_progress && sd_term);
+    int32_t sd[8]={7,-1,-1,0,0x1234,0,0,0};
+    assert(!sd_init() && sd_ready()==1);
+    assert((uint32_t)sd_result(sd)==0x80B80005); /* not finished before it is opened */
+    assert(!sd_open(NULL) && !sd_progress(0,50) && !sd_close(NULL));
+    assert(!sd_result(sd) && sd[0]==7 && sd[1]==0 && sd[2]==1 && sd[4]==0x1234);
+    assert(!sd_term());
+    puts("optional services: scheduler round-trip, trophy bit/count, content search and save data dialog contracts passed");
 }

@@ -333,6 +333,22 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
 DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
+/* SaveDataDialog (saving, loading, errors): finished with OK. OrbisSaveDataDialogResult: mode,
+ * result, buttonId, reserved, then the caller's pointers (dirName, param, userData), left as set. */
+static ABI int32_t save_result(int32_t *result) {
+    if (!result) return (int32_t)0x80B8000A; /* COMMON_DIALOG PARAM_INVALID */
+    if (dialogs[2].status!=3) return (int32_t)0x80B80005; /* NOT_FINISHED */
+    result[1]=0; /* OK */
+    result[2]=1; /* button OK / YES */
+    return 0;
+}
+static ABI int32_t save_ready(void) { return 1; }
+static ABI int32_t save_close(const void *param) {
+    (void)param;
+    if (!dialogs[2].initialized) return DIALOG_NOT_INITIALIZED;
+    dialogs[2].status=3; return 0;
+}
+static ABI int32_t save_progress(int32_t target, uint32_t value) { (void)target; (void)value; return 0; }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
  * option, max length, char16 buffer, position, alignment, placeholder, title. */
@@ -643,6 +659,9 @@ static const RuntimeExport exports[]={
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogGetStatus",save_status}, {"sceSaveDataDialogGetResult",save_result},
+    {"sceSaveDataDialogIsReadyToDisplay",save_ready}, {"sceSaveDataDialogClose",save_close},
+    {"sceSaveDataDialogProgressBarSetValue",save_progress}, {"sceSaveDataDialogProgressBarInc",save_progress},
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},

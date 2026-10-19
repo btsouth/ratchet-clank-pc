@@ -85,16 +85,42 @@ GraphicsPipeline::GraphicsPipeline(
     job->num_modules = modules.size();
     job->sdata = sdata;
     job->built = deferral->built;
+    job->submit = deferral->submit;
+    job->pipeline_cache = pipeline_cache;
+    deferred = job;
     handle_pending.store(true, std::memory_order_release);
-    deferral->submit([this, pipeline_cache, job] {
-        Build(pipeline_cache, job->runtime_infos,
-              std::span<const vk::ShaderModule>{job->modules.data(), job->num_modules}, job->sdata,
-              false);
-        if (job->built) {
-            job->built(job->sdata);
-        }
-        PublishHandle();
-    });
+    deferral->submit(
+        [this, job] {
+            if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                RunDeferred(*job);
+            }
+        },
+        false);
+}
+
+void GraphicsPipeline::Expedite() const {
+    // A second job ahead of the queue: whichever runs first builds (the claim).
+    if (!deferred || deferred->claimed.load(std::memory_order_acquire) ||
+        deferred->expedited.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    auto* self = const_cast<GraphicsPipeline*>(this);
+    deferred->submit(
+        [self, job = deferred] {
+            if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                self->RunDeferred(*job);
+            }
+        },
+        true);
+}
+
+void GraphicsPipeline::RunDeferred(DeferredBuild& job) {
+    Build(job.pipeline_cache, job.runtime_infos,
+          std::span<const vk::ShaderModule>{job.modules.data(), job.num_modules}, job.sdata, false);
+    if (job.built) {
+        job.built(job.sdata);
+    }
+    PublishHandle();
 }
 
 void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
@@ -484,7 +510,12 @@ void GraphicsPipeline::Build(vk::PipelineCache pipeline_cache,
 }
 
 GraphicsPipeline::~GraphicsPipeline() {
-    WaitHandle(); // the worker may still write (or notify on) this object
+    // A build no one started never runs (its job only checks the claim); a started one may
+    // still write (or notify on) this object.
+    if (deferred && !deferred->claimed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    WaitHandle();
 }
 
 template <typename Attribute, typename Binding>

@@ -22,6 +22,9 @@ namespace Vulkan {
 /// bbport: time a thread that makes the game's frames waited for a shader or pipeline compile
 /// (on the GPU thread, or a recorder waiting for a pipeline built on a worker); never reset.
 extern std::atomic<u64> g_bb_compile_stall_ns;
+/// bbport: draws recorded without their pipeline because it was still being built
+/// (Pipeline::HandleForDraw); never reset.
+extern std::atomic<u64> g_bb_pipeline_skipped_draws;
 
 
 static constexpr auto AllGraphicsStageBits =
@@ -46,6 +49,19 @@ public:
     vk::Pipeline Handle() const {
         if (handle_pending.load(std::memory_order_acquire)) {
             WaitHandle();
+        }
+        return *pipeline;
+    }
+
+    /// bbport: Handle() for a draw, which may go without its pipeline: a first-visit compile
+    /// must not hold back the frame (and the flip the game's watchdog waits for). Null when
+    /// the pipeline is still being built and the wait budget of this shown frame is spent: a
+    /// `recurring` draw (geometry into a target drawn in each of the last frames) gets
+    /// BB_PIPELINE_WAIT_MS of it, any other BB_PIPELINE_STALL_MS (also a pipeline missing in
+    /// BB_PIPELINE_SKIP_FRAMES shown frames). Its build moves ahead of the queued ones.
+    vk::Pipeline HandleForDraw(bool recurring) const {
+        if (handle_pending.load(std::memory_order_acquire)) {
+            return HandleForDrawSlow(recurring);
         }
         return *pipeline;
     }
@@ -86,6 +102,9 @@ protected:
     [[nodiscard]] std::string GetDebugString() const;
 
     void WaitHandle() const;
+    vk::Pipeline HandleForDrawSlow(bool recurring) const;
+    /// Moves its build ahead of the queued ones, if it has not started.
+    virtual void Expedite() const {}
     /// Called by the worker once `pipeline` is set.
     void PublishHandle();
 
@@ -102,6 +121,8 @@ protected:
     std::atomic<bool> handle_pending{false};
     mutable std::mutex handle_mutex;
     mutable std::condition_variable handle_cv;
+    mutable u32 missing_frame = ~0u; ///< the last shown frame a draw found it pending
+    mutable u32 missing_frames = 0;  ///< shown frames in which a draw found it pending
 };
 
 } // namespace Vulkan

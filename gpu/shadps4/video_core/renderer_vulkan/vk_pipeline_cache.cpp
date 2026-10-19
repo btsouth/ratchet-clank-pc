@@ -480,6 +480,11 @@ void PipelineCache::SaveDriverCache() {
     }
 }
 
+// bbport (diagnostics, the flip watchdog report): when the GPU thread's current compile began
+// (steady clock ns, 0: not compiling), and pipeline builds queued or running on workers.
+std::atomic<s64> g_bb_compiling_since_ns;
+std::atomic<u32> g_bb_pipeline_jobs;
+
 /// bbport BB_ASYNC_PIPELINES: worker threads creating graphics pipelines (the driver's compile,
 /// vkCreateGraphicsPipelines, with its own VkPipelineCache synchronization). Jobs run in order.
 class PipelineCompiler {
@@ -499,10 +504,18 @@ public:
             worker.join();
         }
     }
-    void Submit(std::function<void()> job) {
+    /// `urgent`: ahead of the other jobs, after the urgent ones queued before it (a draw waits
+    /// for it; the earliest such draw holds back the frame's later commands).
+    void Submit(std::function<void()> job, bool urgent = false) {
+        g_bb_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock lk{mutex};
-            jobs.push_back(std::move(job));
+            if (urgent) {
+                jobs.insert(jobs.begin() + urgent_queued, std::move(job));
+                ++urgent_queued;
+            } else {
+                jobs.push_back(std::move(job));
+            }
         }
         cv.notify_one();
     }
@@ -524,9 +537,11 @@ private:
                 }
                 job = std::move(jobs.front());
                 jobs.pop_front();
+                urgent_queued -= urgent_queued != 0;
                 ++running;
             }
             job();
+            g_bb_pipeline_jobs.fetch_sub(1, std::memory_order_relaxed);
             {
                 std::scoped_lock lk{mutex};
                 --running;
@@ -539,6 +554,7 @@ private:
     std::condition_variable idle_cv;
     u32 running = 0;
     std::deque<std::function<void()>> jobs;
+    size_t urgent_queued = 0; ///< the first jobs in `jobs` that are urgent
     std::vector<std::thread> workers;
     bool stop = false;
 };
@@ -547,6 +563,9 @@ struct PipelineCache::PendingPipeline {
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
+    /// Taken by whoever runs `build`: the worker, or the GPU thread when a draw needs it now.
+    std::atomic<bool> claimed{false};
+    std::function<void()> build;
     std::unique_ptr<GraphicsPipeline> pipeline;
     GraphicsPipeline::SerializationSupport sdata{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -579,11 +598,59 @@ double ProfileSeconds() {
     static const auto start = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
+/// bbport: GPU-thread shader translation per shown frame for graphics draws; past it they are
+/// left out and their shaders translated in the frames after. Recurring geometry
+/// (PipelineCache::RecurringDraw) gets BB_SHADER_WAIT_MS of it, other draws BB_SHADER_FRAME_MS.
+/// A first visit brings hundreds of shaders: a few ms each on a slow CPU kept LBP3's flip from
+/// its watchdog (~1 s of translation in one frame on devbox).
+/// With no frame shown for RenewAfter (offscreen work while loading), the budget renews too.
+struct TranslationBudget {
+    static constexpr auto RenewAfter = std::chrono::milliseconds(500);
+    u32 frame = ~0u;
+    std::chrono::steady_clock::time_point since{};
+    u64 used_ns = 0;
+    void Renew() {
+        const u32 shown = BbStats::frame_number.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (shown != frame || now - since >= RenewAfter) {
+            frame = shown;
+            since = now;
+            used_ns = 0;
+        }
+    }
+    bool Spent(bool recurring) {
+        const auto env_ms = [](const char* name, u64 fallback) {
+            const char* env = std::getenv(name);
+            return (env && *env ? std::strtoull(env, nullptr, 10) : fallback) * 1'000'000;
+        };
+        static const u64 recurring_ns = env_ms("BB_SHADER_WAIT_MS", 16);
+        static const u64 other_ns = env_ms("BB_SHADER_FRAME_MS", 60);
+        Renew();
+        return used_ns >= (recurring ? recurring_ns : other_ns);
+    }
+    void Charge(u64 ns) {
+        Renew();
+        used_ns += ns;
+    }
+};
+TranslationBudget translation_budget; ///< GPU thread only
+} // namespace
+std::atomic<u64> g_bb_translation_skipped_draws;
+namespace {
+
 struct CompileTimer {
     const char* what = nullptr; // a pipeline: reported with its hash when profiled or slow
     u64 hash = 0;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    bool outermost = [this] {
+        s64 idle = 0;
+        return g_bb_compiling_since_ns.compare_exchange_strong(
+            idle, start.time_since_epoch().count(), std::memory_order_relaxed);
+    }();
     ~CompileTimer() {
+        if (outermost) {
+            g_bb_compiling_since_ns.store(0, std::memory_order_relaxed);
+        }
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - start)
                                .count());
@@ -642,12 +709,12 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
 
 namespace {
 /// bbport BB_ASYNC_PIPELINES: per render target (its address), how many frames in a row draws
-/// went to it. Only the GPU thread (pipeline selection) touches it.
+/// went to it. Per thread: pipeline selection (GPU thread) and draw recording keep their own.
 struct TargetStreak {
     u32 last_frame = ~0u;
     u32 frames = 0;
 };
-std::unordered_map<u64, TargetStreak> target_streaks;
+thread_local std::unordered_map<u64, TargetStreak> target_streaks;
 
 /// The draw's render target: its first color buffer written, else its depth buffer, else 0.
 u64 DrawTarget(const AmdGpu::Regs& regs) {
@@ -663,8 +730,8 @@ u64 DrawTarget(const AmdGpu::Regs& regs) {
 
 /// Counts the frames in a row a target is drawn to (once per frame and target).
 void NoteDrawTarget(const AmdGpu::Regs& regs) {
-    static u64 last_target = 0;
-    static u32 last_frame = ~0u;
+    thread_local u64 last_target = 0;
+    thread_local u32 last_frame = ~0u;
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
     const u64 target = DrawTarget(regs);
     if (target == 0 || (target == last_target && frame == last_frame)) {
@@ -680,6 +747,22 @@ void NoteDrawTarget(const AmdGpu::Regs& regs) {
 }
 } // namespace
 
+bool PipelineCache::RecurringDraw(const AmdGpu::Regs& regs, bool indirect) {
+    // Geometry (not a full-screen pass, nor an indirect draw of unknown size) into a target
+    // drawn in each of the last few shown frames: a frame without it shows as a late object,
+    // not a hole in a one-time render or a grey frame.
+    constexpr u32 FullScreenIndices = 12;
+    constexpr u32 RecurringStreak = 4;
+    NoteDrawTarget(regs);
+    if (indirect || regs.num_indices <= FullScreenIndices) {
+        return false;
+    }
+    const u64 target = DrawTarget(regs);
+    const auto streak = target_streaks.find(target);
+    return target != 0 && streak != target_streaks.end() &&
+           streak->second.frames >= RecurringStreak;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
@@ -692,7 +775,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     }
     sel.draw_indirect_params = params;
-    if (!RefreshGraphicsKey(sel)) {
+    sel.recurring = RecurringDraw(liverpool->regs, indirect);
+    const bool selected = RefreshGraphicsKey(sel);
+    sel.may_defer_translation = false;
+    if (!selected) {
+        if (sel.translation_deferred) {
+            g_bb_translation_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        }
         return nullptr;
     }
     if (const auto found = graphics_pipelines.find(sel.graphics_key); found != graphics_pipelines.end()) {
@@ -709,8 +798,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                     ++async_skipped;
                     return nullptr; // drawn from the frame its pipeline is ready
                 }
-                // A pass that is not drawn every frame needs it now: the wait is compile time.
+                // A pass that is not drawn every frame needs it now: the wait is compile time,
+                // and the build runs here if no worker has started it (it may be queued
+                // behind many others).
                 const auto start = std::chrono::steady_clock::now();
+                if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                    lk.unlock();
+                    job->build();
+                    lk.lock();
+                }
                 job->cv.wait(lk, [&] { return job->done; });
                 const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - start)
@@ -730,9 +826,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         pending_graphics.emplace(sel.graphics_key, job);
         ++async_started;
         ++g_bb_compiles;
-        compiler->Submit([this, job, key = sel.graphics_key, infos = sel.infos,
-                          runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
-                          modules = sel.modules]() mutable {
+        job->build = [this, job = job.get(), key = sel.graphics_key, infos = sel.infos,
+                      runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
+                      modules = sel.modules]() mutable {
             GraphicsPipeline::SerializationSupport sdata{};
             auto pipeline = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
@@ -742,6 +838,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             job->sdata = std::move(sdata);
             job->done = true;
             job->cv.notify_all();
+        };
+        compiler->Submit([job] {
+            if (!job->claimed.exchange(true, std::memory_order_acq_rel)) {
+                job->build();
+            }
         });
         sel.fetch_shader.reset();
         return nullptr;
@@ -763,7 +864,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             const auto queued = std::chrono::steady_clock::now();
             const GraphicsPipeline::Deferral deferral{
                 .submit =
-                    [this, queued, pipeline_hash](std::function<void()> job) {
+                    [this, queued, pipeline_hash](std::function<void()> job, bool urgent) {
                         compiler->Submit([job = std::move(job), queued, pipeline_hash] {
                             const auto start = std::chrono::steady_clock::now();
                             job();
@@ -778,7 +879,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                             ms(start, end), ms(queued, start));
                                 std::fflush(stdout);
                             }
-                        });
+                        }, urgent);
                     },
                 .built =
                     [key = sel.graphics_key, pipeline_hash](
@@ -834,12 +935,14 @@ void PipelineCache::EnsureCompiler() {
     if (compiler) {
         return;
     }
-    // Half the hardware threads, 2 to 8: they only work in bursts of new pipelines. LBP3's
-    // first area brings ~300 (13 s of driver compile on Intel ANV, cold): 3 threads missed the
-    // game's 1 s flip watchdog, 8 made it.
+    // Three quarters of the hardware threads, 2 to 20: they only work in bursts of new
+    // pipelines, while the game mostly waits for them. LBP3's first area brings ~300 (13 s of
+    // driver compile on Intel ANV, 50-140 ms each on NVIDIA, cold); 8 threads on a 28-thread
+    // PC left over 1 s of compiles in one frame.
     const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
-    const u32 threads = env && *env ? u32(std::strtoul(env, nullptr, 10))
-                                    : std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+    const u32 threads =
+        env && *env ? u32(std::strtoul(env, nullptr, 10))
+                    : std::clamp(std::thread::hardware_concurrency() * 3 / 4, 2u, 20u);
     compiler = std::make_unique<PipelineCompiler>(std::max(threads, 1u));
     std::printf("GPU: new graphics pipelines compile on %u threads (BB_ASYNC_PIPELINES=0: on the "
                 "GPU thread, the game waits)\n",
@@ -883,10 +986,14 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
             printed = second;
             std::printf("GPU: %llu pipelines compiled in the background, %llu draws went without "
                         "theirs meanwhile, %llu waited for one; %llu more built on workers for "
-                        "the recorder, which waited %.1f ms for them\n",
+                        "the recorder, which waited %.1f ms for them and recorded %llu draws "
+                        "without theirs; %llu draws left out until their shaders are "
+                        "translated\n",
                         (unsigned long long)async_started, (unsigned long long)async_skipped,
                         (unsigned long long)async_waited, (unsigned long long)deferred_started,
-                        double(g_bb_pipeline_wait_ns.exchange(0)) / 1e6);
+                        double(g_bb_pipeline_wait_ns.exchange(0)) / 1e6,
+                        (unsigned long long)g_bb_pipeline_skipped_draws.exchange(0),
+                        (unsigned long long)g_bb_translation_skipped_draws.exchange(0));
             async_started = async_skipped = async_waited = deferred_started = 0;
         }
     }
@@ -1143,6 +1250,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(sel, stage_in, stage_out, params, binding);
+        if (sel.translation_deferred) {
+            return false;
+        }
         if (fetch_shader_) {
             sel.fetch_shader = fetch_shader_;
         }
@@ -1151,8 +1261,15 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
+    // bbport: the GPU thread's selection may leave a draw out instead of translating past the
+    // frame's budget (TranslationBudget).
+    sel.may_defer_translation = !sel.worker;
+    sel.translation_deferred = false;
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    if (sel.translation_deferred) {
+        return false;
+    }
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -1221,6 +1338,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
     }
+    if (sel.translation_deferred) {
+        return false;
+    }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
@@ -1255,6 +1375,15 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const auto budget_start = std::chrono::steady_clock::now();
+    const struct BudgetCharge {
+        std::chrono::steady_clock::time_point start;
+        ~BudgetCharge() {
+            translation_budget.Charge(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count()));
+        }
+    } budget_charge{budget_start};
     CompileTimer timer;
     const bool shader_profile = ShaderProfile();
     using Clock = std::chrono::steady_clock;
@@ -1385,6 +1514,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
     if (it_pgm == program_cache.end()) {
+        if (sel.may_defer_translation && translation_budget.Spent(sel.recurring)) {
+            sel.translation_deferred = true;
+            return {};
+        }
         auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto start = binding;
         const auto module =
@@ -1430,6 +1563,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         program->last_used = std::distance(program->modules.begin(), it);
     }
     if (it == program->modules.end()) {
+        if (sel.may_defer_translation && translation_budget.Spent(sel.recurring)) {
+            sel.translation_deferred = true;
+            return {};
+        }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 

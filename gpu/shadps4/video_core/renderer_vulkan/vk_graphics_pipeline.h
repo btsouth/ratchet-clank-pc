@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -85,10 +86,10 @@ public:
         bool Deserialize(Serialization::Archive& ar);
     };
 
-    /// bbport: with a deferral, the driver compile runs through `submit` (a worker) and
-    /// `built` gets the completed serialization data there.
+    /// bbport: with a deferral, the driver compile runs through `submit` (a worker; `urgent`:
+    /// ahead of the queued builds) and `built` gets the completed serialization data there.
     struct Deferral {
-        std::function<void(std::function<void()>)> submit;
+        std::function<void(std::function<void()>, bool urgent)> submit;
         std::function<void(const SerializationSupport&)> built;
     };
 
@@ -121,6 +122,7 @@ public:
                          u32 step_rate_1, std::span<const AmdGpu::Buffer> sharps = {}) const;
 
 private:
+    void Expedite() const override;
     void BuildDescSetLayout(bool preloading);
     void Build(vk::PipelineCache pipeline_cache,
                std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
@@ -133,7 +135,16 @@ private:
         size_t num_modules{};
         SerializationSupport sdata{};
         std::function<void(const SerializationSupport&)> built;
+        std::function<void(std::function<void()>, bool)> submit;
+        vk::PipelineCache pipeline_cache;
+        /// Taken by whoever runs the build: its job or the expedited copy (or the destructor,
+        /// which cancels a build not started).
+        std::atomic<bool> claimed{false};
+        std::atomic<bool> expedited{false};
     };
+    /// Runs the deferred build once claimed.
+    void RunDeferred(DeferredBuild& job);
+    std::shared_ptr<DeferredBuild> deferred;
 
 private:
     GraphicsPipelineKey key;

@@ -43,6 +43,11 @@ namespace Vulkan {
 extern std::atomic<u64> g_bb_compile_ns;
 extern std::atomic<u32> g_bb_compiles;
 extern std::atomic<u64> g_bb_compile_stall_ns;
+extern std::atomic<u64> g_bb_pipeline_wait_ns;
+extern std::atomic<u64> g_bb_pipeline_skipped_draws;
+extern std::atomic<u64> g_bb_translation_skipped_draws;
+extern std::atomic<s64> g_bb_compiling_since_ns;
+extern std::atomic<u32> g_bb_pipeline_jobs;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -861,6 +866,21 @@ void VideoOutDriver::ReportFlipState() {
                 main_port.flip_rate, (unsigned long long)main_port.vblank_status.count,
                 main_port.flip_events.size(), ago(last_submit_ns.load()),
                 ago(last_internal_ns.load()), ago(last_flip_ns.load()));
+    // Where a frame's compiles went (totals since the last stats lines, every 5 s).
+    const s64 compiling = Vulkan::g_bb_compiling_since_ns.load(std::memory_order_relaxed);
+    const double compiling_ms =
+        compiling
+            ? double(std::chrono::steady_clock::now().time_since_epoch().count() - compiling) / 1e6
+            : -1.0;
+    std::printf("Compiles: GPU thread %u, %.1f ms, in one for %.1f ms (-1: not); recorder "
+                "waited %.1f ms for pipelines, drew %llu draws without theirs; %llu draws left "
+                "out for untranslated shaders; %u pipeline builds queued or running\n",
+                Vulkan::g_bb_compiles.load(), double(Vulkan::g_bb_compile_ns.load()) / 1e6,
+                compiling_ms,
+                double(Vulkan::g_bb_pipeline_wait_ns.load()) / 1e6,
+                (unsigned long long)Vulkan::g_bb_pipeline_skipped_draws.load(),
+                (unsigned long long)Vulkan::g_bb_translation_skipped_draws.load(),
+                Vulkan::g_bb_pipeline_jobs.load());
     std::fflush(stdout);
     lock.unlock();
     FlipTrace::Dump();
