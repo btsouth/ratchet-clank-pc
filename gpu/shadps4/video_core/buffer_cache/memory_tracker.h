@@ -117,8 +117,8 @@ public:
         for (const auto& [a, b] : runs) {
             for (VAddr page = a; page < b; page += 4096) {
                 auto* manager = top_tier[page >> TRACKER_HIGHER_PAGE_BITS];
-                if (manager && !manager->template IsRegionModified<Type::CPU>(
-                                   page - manager->GetCpuAddr(), 4096)) {
+                if (manager && manager->AsyncPage((page - manager->GetCpuAddr()) /
+                                                  TRACKER_BYTES_PER_PAGE)) {
                     ++stale;
                 }
             }
