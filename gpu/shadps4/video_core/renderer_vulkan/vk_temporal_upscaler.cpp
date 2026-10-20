@@ -686,7 +686,8 @@ bool TemporalUpscaler::RecordFsr3(vk::CommandBuffer cmdbuf, vk::Image color,
                                   FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
     info.output = Describe(vk::Image(output_image), vk::Format::eR16G16B16A16Sfloat, ow, oh,
                            vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
-                               vk::ImageUsageFlagBits::eTransferSrc,
+                               vk::ImageUsageFlagBits::eTransferSrc |
+                               vk::ImageUsageFlagBits::eTransferDst,
                            vk::ImageAspectFlagBits::eColor,
                            FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS);
     // Optional inputs, absent: a described but null image.
@@ -870,8 +871,10 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
+        // Transfer destination: DLSS clears its output with vkCmdClearColorImage,
+        // which needs it (the validation layer's VUID-vkCmdClearColorImage-image-00002).
         .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
-                 vk::ImageUsageFlagBits::eTransferSrc,
+                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     output_view = Check(device.createImageViewUnique({
