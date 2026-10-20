@@ -110,8 +110,8 @@ the image is scaled to your window. If DLSS can't start (no NVIDIA RTX GPU or no
 3.1 is used.
 
 The game's 120 FPS and Unlocked modes are patched in by the port. The game's own clock is patched
-too, so it does not run faster at higher frame rates. On the tested RTX 4070 SUPER the 120 FPS mode
-runs at about 80 FPS in busy scenes, because the CPU side is the limit.
+too, so it does not run faster at higher frame rates. The 120 FPS mode does not hold 120 in busy
+scenes yet, because the CPU side is the limit.
 
 Settings are stored in `bbport.ini` in the data folder. The in-game overlay (Insert key, or L3+R3
 on a controller) can change the upscaler, sharpening and motion blur while you play.
@@ -151,7 +151,7 @@ start without them. Each one can still be overridden. `run.sh` explains each.
   overlay.
 - No one has played the game from start to finish on the port yet.
 - The first visit to each area stutters while shaders compile. Later visits use the cache.
-- 120 FPS is not steady yet: busy scenes run at about 80 FPS on the tested PC. 60 FPS is the
+- 120 FPS is not steady yet: busy scenes run well below it on the tested PC. 60 FPS is the
   recommended preset. Unlocked is less tested still.
 - Don't set `BB_VBLANK_HZ=480`. With very high frame rates at 480 Hz the game has frozen. The
   port uses 240 Hz instead.
