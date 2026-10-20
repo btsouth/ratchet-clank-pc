@@ -128,7 +128,7 @@ You don't need these for normal play. They are for testing and bug reports.
 | `BB_FPS` | `60` | `30`, `60`, `120` or `uncap` |
 | `BB_UPSCALER` | `dlss` on NVIDIA, else `fsr3` | `dlss`, `fsr3` or `off` (the game's TAA) |
 | `BB_GAME_AA` | `1` | `0` turns off the DLSS/FSR stand-in for the game's TAA |
-| `BB_READBACK_LINEAR_ASYNC` | `1` | `0` waits for every GPU readback (slower, for comparisons) |
+| `BB_READBACK_LINEAR_ASYNC` | `0` | `1` copies GPU readbacks without waiting (faster, but planet loads can crash) |
 | `BB_VBLANK_HZ` | `60`, or `240` for 120 and Unlocked | The port's vblank rate |
 | `BB_FPS_LIMIT` | set by the preset | Frame limit in FPS, `0` for none |
 | `BB_SAVE_LOG` | | `1` writes the log to `logs/` in the data folder |
@@ -147,8 +147,6 @@ start without them. Each one can still be overridden. `run.sh` explains each.
   recommended preset. Unlocked is less tested still.
 - Don't set `BB_VBLANK_HZ=480`. With very high frame rates at 480 Hz the game has frozen. The
   port uses 240 Hz instead.
-- Occlusion data arrives a frame later than on the PS4 (`BB_READBACK_LINEAR_ASYNC=1`, much faster).
-  If you see objects pop in when turning the camera, try `BB_READBACK_LINEAR_ASYNC=0` and report it.
 - On CPUs without AMD's SSE4a instructions (all Intel CPUs) a few game instructions are emulated.
   This is automatic and costs almost nothing.
 - AMD GPUs run with the same memory model as NVIDIA (`BB_PC_MODEL=0`). bbport's newer model is not

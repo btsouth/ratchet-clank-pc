@@ -229,7 +229,7 @@ class RatchetDefaultTests(unittest.TestCase):
         self.assertEqual({key: env[key] for key in RATCHET_KEYS[2:10]}, {
             'BB_HINTLESS_BASE': '0x7000000000', 'BB_STUB_IMPORTS': '1',
             'BB_CREATE_YIELD_US': '2000', 'BB_CREATE_YIELD_ALL': '1', 'BB_READBACK_LINEAR': '1',
-            'BB_READBACK_LINEAR_ASYNC': '1', 'BB_GAME_AA': '1', 'BB_PC_MODEL': '0'})
+            'BB_READBACK_LINEAR_ASYNC': '0', 'BB_GAME_AA': '1', 'BB_PC_MODEL': '0'})
 
     def test_default_preset_is_60(self):
         env = self.launch()
@@ -242,10 +242,10 @@ class RatchetDefaultTests(unittest.TestCase):
         self.assertEqual((env['BB_VBLANK_HZ'], env['BB_FPS_LIMIT']), ('240', None))
 
     def test_explicit_values_win(self):
-        env = self.launch(BB_READBACK_LINEAR_ASYNC='0', BB_GAME_AA='0', BB_PC_MODEL='1',
+        env = self.launch(BB_READBACK_LINEAR_ASYNC='1', BB_GAME_AA='0', BB_PC_MODEL='1',
                           BB_HINTLESS_BASE='0x6000000000')
         self.assertEqual((env['BB_READBACK_LINEAR_ASYNC'], env['BB_GAME_AA'], env['BB_PC_MODEL'],
-                          env['BB_HINTLESS_BASE']), ('0', '0', '1', '0x6000000000'))
+                          env['BB_HINTLESS_BASE']), ('1', '0', '1', '0x6000000000'))
 
     def test_upscaler_by_gpu(self):
         self.assertEqual(self.launch(vendor='0x10de')['BB_UPSCALER'], 'dlss')
