@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -195,13 +198,49 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
             buffer_cache.InvalidateMemory(image.info.guest_address, download_size);
         }
     } else {
+        // The copy lands once the GPU is done, possibly after the game has given the memory to
+        // something else (a planet load reused it for command buffers): it is skipped when the
+        // memory changed since now (the GPU owns the image, so the game only writes it on reuse).
+        const auto guest_hash = [](VAddr address, u64 size) {
+            std::vector<u8> bytes(size); // through the backing view: no fault on protected pages
+            Core::Memory::Instance()->ReadBacking(address, bytes.data(), size);
+            return XXH3_64bits(bytes.data(), size);
+        };
+        const u64 before = guest_hash(image.info.guest_address, download_size);
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+            [this, device_addr = image.info.guest_address, download, download_size, before,
+             guest_hash] {
                 download.Invalidate();
+                // What our own earlier copy left there counts as unchanged too.
+                static std::mutex landed_mutex;
+                static std::unordered_map<VAddr, u64> landed;
+                const u64 now = guest_hash(device_addr, download_size);
+                bool ours = false;
+                {
+                    std::scoped_lock lock{landed_mutex};
+                    const auto it = landed.find(device_addr);
+                    ours = it != landed.end() && it->second == now;
+                }
+                if (now != before && !ours) {
+                    static std::atomic<u64> skipped{0};
+                    const u64 n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 8 || n % 100 == 0) {
+                        std::printf("Readback: the game rewrote %#llx (%llu bytes) before its copy "
+                                    "landed; skipped (%llu so far)\n",
+                                    (unsigned long long)device_addr,
+                                    (unsigned long long)download_size, (unsigned long long)n);
+                    }
+                    runtime.GetStagingPool().FreeDeferred(download);
+                    return;
+                }
                 BbFreeCheck::Check(device_addr, download_size, download.mapped,
                                    BbFreeCheck::ImageDownload);
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
+                {
+                    std::scoped_lock lock{landed_mutex};
+                    landed[device_addr] = XXH3_64bits(download.mapped, download_size);
+                }
                 if (!WriteTracking()) {
                     buffer_cache.InvalidateMemory(device_addr, download_size);
                 }
