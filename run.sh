@@ -190,8 +190,10 @@ export BB_PREUPLOAD=${BB_PREUPLOAD:-1}
 # - BB_STUB_IMPORTS: system functions the runtime lacks return 0 instead of stopping the game;
 # - BB_CREATE_YIELD_*: a new thread runs before its creator goes on, as on the PS4 (otherwise
 #   renderer start races the Render Thread and the game exits);
-# - BB_READBACK_LINEAR(_ASYNC): the occlusion buffer the CPU reads is a linear image, downloaded
-#   every frame without waiting for the GPU at each fence;
+# - BB_READBACK_LINEAR: the occlusion buffer the CPU reads is a linear image, downloaded every
+#   frame. BB_READBACK_LINEAR_ASYNC=1 copies it without waiting for the GPU, but a late copy can
+#   land in memory the game has reused by then (planet loads crashed with stale data in command
+#   buffers and null pointers), so it is off;
 # - BB_GAME_AA: DLSS or FSR 3.1 in place of the game's TAA (upscaler below);
 # - BB_PC_MODEL=0: the memory model it was tested with, on every GPU.
 # The CPU's missing SSE4a instructions are emulated automatically (src/runtime_sse4a.c).
@@ -199,7 +201,7 @@ if (( ratchet )); then
     export BB_HINTLESS_BASE=${BB_HINTLESS_BASE:-0x7000000000}
     export BB_STUB_IMPORTS=${BB_STUB_IMPORTS:-1}
     export BB_CREATE_YIELD_US=${BB_CREATE_YIELD_US:-2000} BB_CREATE_YIELD_ALL=${BB_CREATE_YIELD_ALL:-1}
-    export BB_READBACK_LINEAR=${BB_READBACK_LINEAR:-1} BB_READBACK_LINEAR_ASYNC=${BB_READBACK_LINEAR_ASYNC:-1}
+    export BB_READBACK_LINEAR=${BB_READBACK_LINEAR:-1} BB_READBACK_LINEAR_ASYNC=${BB_READBACK_LINEAR_ASYNC:-0}
     export BB_GAME_AA=${BB_GAME_AA:-1}
     export BB_PC_MODEL=${BB_PC_MODEL:-0}
 fi
