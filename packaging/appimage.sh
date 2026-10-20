@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Builds dist/Bloodborne-bbport-x86_64.AppImage: the port's current build (run build.sh first),
-# its scripts and the launcher, bundled with their Nix closure (nix-appimage: the AppImage mounts
-# its /nix/store with user namespaces, available on SteamOS and most desktops).
+# its scripts and the launcher, bundled with their Nix closure by nix-appimage, then repacked so
+# it needs no user namespaces (packaging/relocate.py: Ubuntu 23.10 and later restrict them).
 # Running it opens the launcher; `--play` starts the game with the launcher's saved settings.
 # Data (generated files, saves, bbport.ini): ~/.local/share/bbport (BB_DATA_DIR).
 # BB_PACKAGE_GAME=ratchet: dist/Ratchet-Clank-port-x86_64.AppImage, the Ratchet & Clank launcher,
 # data in ~/.local/share/ratchet-port.
 set -euo pipefail
-if [[ ${BB_PACKAGE_GAME:-} == ratchet ]]; then name=Ratchet-Clank-port; else name=Bloodborne-bbport; fi
+# LINK: where the bundle's store is found at run time (as long as /nix/store, one per game).
+if [[ ${BB_PACKAGE_GAME:-} == ratchet ]]; then name=Ratchet-Clank-port link=/tmp/.racS
+else name=Bloodborne-bbport link=/tmp/.bbpS; fi
 cd -- "$(dirname -- "$0")/.."
 [[ -f out/bb-probe && -f out/gpu/libbbgpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 root=$PWD
@@ -33,11 +35,22 @@ needed_dirs() {
     echo ']'
 } > packaging/runtime-paths.nix
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+w "$work" 2> /dev/null; rm -rf "$work"' EXIT
 (cd "$work" && nix bundle --impure --bundler github:ralismark/nix-appimage \
     --expr "import $root/packaging {}")
+# Repacked: the store with its paths rewritten to $link, and packaging/AppRun, behind the same
+# AppImage runtime.
+bundle=$(echo "$work"/*.AppImage)
+offset=$(python3 packaging/relocate.py offset "$bundle")
+squashfs=$(nix-build '<nixpkgs>' -A squashfsTools --no-out-link)/bin
+"$squashfs/unsquashfs" -q -n -d "$work/root" -o "$offset" "$bundle"
+python3 packaging/relocate.py appdir "$work/root" "$work/AppDir" "$link"
+# Timestamps from SOURCE_DATE_EPOCH (set by nix-shell).
+"$squashfs/mksquashfs" "$work/AppDir" "$work/image" -comp zstd -all-root -no-xattrs -noappend -quiet
 mkdir -p dist
-install -m755 "$work"/*.AppImage "dist/$name-x86_64.AppImage"
+head -c "$offset" "$bundle" > "$work/runtime"
+cat "$work/runtime" "$work/image" > "dist/$name-x86_64.AppImage"
+chmod 755 "dist/$name-x86_64.AppImage"
 # A GC root for the package: nix-collect-garbage keeps it, and with it the outputs built here from
 # source (the Vulkan-only Mesa, GTK 4 without GStreamer, libadwaita, SDL3), so the next AppImage
 # does not build them again (only a nixpkgs update does).
