@@ -52,6 +52,16 @@ class IniTests(unittest.TestCase):
             self.assertEqual(rs.read_ini(ini)[0], {'show_fps': '0'})
 
 
+    def test_defaults_fill_only_missing_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ini = Path(directory) / 'bbport.ini'
+            rs.ensure_ini_defaults(ini)
+            self.assertEqual(rs.read_ini(ini)[0], {'effect_motion_blur': '0'})
+            ini.write_text('upscaler=dlss\neffect_motion_blur=1\n')
+            rs.ensure_ini_defaults(ini)  # chosen in the launcher or the in-game menu: kept
+            self.assertEqual(ini.read_text(), 'upscaler=dlss\neffect_motion_blur=1\n')
+
+
 class GameStatusTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -93,6 +93,19 @@ def read_ini(path=None):
     return values, lines
 
 
+# bbport.ini keys the launcher sets when the file lacks them (a choice made in the launcher or the
+# in-game menu stays). The game's motion blur is off: with it the scene flickers while the camera
+# turns, shadows coming and going between frames.
+INI_DEFAULTS = {"effect_motion_blur": "0"}
+
+
+def ensure_ini_defaults(path=None):
+    values, _ = read_ini(path)
+    missing = {key: value for key, value in INI_DEFAULTS.items() if key not in values}
+    if missing:
+        write_ini(missing, path)
+
+
 def write_ini(changes, path=None):
     """Sets the keys in changes (None removes one) and keeps the rest of the file as it is."""
     path = Path(path or ini_path())
