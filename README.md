@@ -15,10 +15,12 @@ by deadinside28, and keeps its loader, runtime and renderer. Only this one game 
 dumped from your own PS4. This project is not affiliated with Sony Interactive Entertainment or
 Insomniac Games.
 
-**Status: experimental, release 0.1.** The game boots, plays its cutscenes, saves and loads, and
+**Status: preview, release 0.1.** The game boots, plays its cutscenes, saves and loads, and
 plays with sound and a controller. Every planet loads and plays at the 60 FPS preset, but no one
 has finished the game on it yet. It has been tested on one desktop (Intel Core i7-14700F, NVIDIA
-RTX 4070 SUPER) and, for correctness only, on an Intel iGPU.
+RTX 4070 SUPER, Arch Linux) and, for correctness only, on an Intel iGPU under Ubuntu 24.04.
+Reports from other GPUs and distributions are very welcome (see
+[Reporting a problem](#reporting-a-problem)).
 
 ## Requirements
 
@@ -66,7 +68,8 @@ launcher window (handy for Steam as a non-Steam game).
 Saves, caches and settings live in `~/.local/share/ratchet-port`. Launcher settings live in
 `~/.config/ratchet-port-launcher`.
 
-The AppImage needs unprivileged user namespaces, which most desktop distributions have on.
+The AppImage does not need unprivileged user namespaces (Ubuntu 23.10 and later restrict them)
+or Nix. While it runs it points the link `/tmp/.racS` at its own files, so run one copy at a time.
 
 ### From source
 
@@ -97,6 +100,7 @@ The launcher covers the common ones:
 | Frame rate | **60 FPS** (default), 120 FPS, Unlocked, 30 FPS (as on PS4) |
 | Anti-aliasing | **Auto**: DLSS on NVIDIA RTX, FSR 3.1 on other GPUs. Or DLSS, FSR 3.1, or the game's own TAA |
 | Show FPS counter | Off by default |
+| Motion blur | **Off** by default (see [Known issues](#known-issues)) |
 | Fullscreen and monitor | Windowed on the primary monitor by default |
 | Controller | The first one connected, or a specific one |
 | Language | The console language the game sees. Only English is tested |
@@ -106,8 +110,8 @@ the image is scaled to your window. If DLSS can't start (no NVIDIA RTX GPU or no
 3.1 is used.
 
 The game's 120 FPS and Unlocked modes are patched in by the port. The game's own clock is patched
-too, so it does not run faster at higher frame rates. On the tested RTX 4070 SUPER the 120 FPS mode
-runs at about 80 FPS in busy scenes, because the CPU side is the limit.
+too, so it does not run faster at higher frame rates. The 120 FPS mode does not hold 120 in busy
+scenes yet, because the CPU side is the limit.
 
 Settings are stored in `bbport.ini` in the data folder. The in-game overlay (Insert key, or L3+R3
 on a controller) can change the upscaler, sharpening and motion blur while you play.
@@ -141,9 +145,13 @@ start without them. Each one can still be overridden. `run.sh` explains each.
 ## Known issues
 
 - Only CUSA01073 version 01.00 is tested. The US release and updated versions are not.
+- The game's motion blur is off by default. With it on, shadows can flicker while the camera
+  turns: the blurred image sometimes misses shadows the frame has. The cause is not found yet
+  ([notes](docs/ratchet-motion-blur.md)). You can turn it back on in the launcher or the in-game
+  overlay.
 - No one has played the game from start to finish on the port yet.
 - The first visit to each area stutters while shaders compile. Later visits use the cache.
-- 120 FPS is not steady yet: busy scenes run at about 80 FPS on the tested PC. 60 FPS is the
+- 120 FPS is not steady yet: busy scenes run well below it on the tested PC. 60 FPS is the
   recommended preset. Unlocked is less tested still.
 - Don't set `BB_VBLANK_HZ=480`. With very high frame rates at 480 Hz the game has frozen. The
   port uses 240 Hz instead.
