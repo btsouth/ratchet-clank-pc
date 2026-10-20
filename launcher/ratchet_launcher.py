@@ -98,6 +98,10 @@ class LauncherWindow(Adw.ApplicationWindow):
         video.add(self.upscaler_row)
         self.show_fps_row = Adw.SwitchRow(title="Show FPS counter", active=ini.get("show_fps") == "1")
         video.add(self.show_fps_row)
+        self.motion_blur_row = Adw.SwitchRow(
+            title="Motion blur", subtitle="Makes shadows flicker while the camera turns",
+            active=ini.get("effect_motion_blur", rs.INI_DEFAULTS["effect_motion_blur"]) == "1")
+        video.add(self.motion_blur_row)
         page.add(video)
 
         display = Adw.PreferencesGroup(title="Display")
@@ -202,7 +206,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         rs.save_settings(s)
         upscaler = self.upscaler_row.values[self.upscaler_row.get_selected()]
         rs.write_ini({"upscaler": upscaler or None,
-                      "show_fps": "1" if self.show_fps_row.get_active() else "0"})
+                      "show_fps": "1" if self.show_fps_row.get_active() else "0",
+                      "effect_motion_blur": "1" if self.motion_blur_row.get_active() else "0"})
 
     # --- log -----------------------------------------------------------------------------
 
@@ -346,6 +351,7 @@ def play():
     if level == "error":
         print(f"ratchet-port: choose the game folder in the launcher first. {text}", file=sys.stderr)
         return 1
+    rs.ensure_ini_defaults()
     os.chdir(rs.PORT_DIR)
     os.execvpe("bash", ["bash", str(rs.PORT_DIR / "run.sh")], rs.game_environment(settings))
 
