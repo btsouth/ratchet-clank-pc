@@ -1,0 +1,24 @@
+#!/bin/sh
+# The bundle's store paths were rewritten from /nix/store to LINK (same length) when it was
+# packaged: LINK points at this AppImage's store, so nothing needs user namespaces (which
+# Ubuntu 23.10 and later restrict) or a /nix on the host.
+link=@LINK@
+dir=${APPDIR:-$(dirname -- "$(readlink -f -- "$0")")}
+if [ -e "$link" ] || [ -L "$link" ]; then
+    if [ ! -L "$link" ] || [ "$(stat -c %u -- "$link")" != "$(id -u)" ]; then
+        echo "$link exists and is not this user's link to the game's files; remove it and start again." >&2
+        exit 1
+    fi
+fi
+if [ "$(readlink -- "$link")" != "$dir/store" ]; then
+    # Another copy still mounted: pointing the link here would pull the game's files from under
+    # it when this one exits.
+    if [ -d "$link/" ]; then
+        message="The game is already running from another copy of this AppImage; close it first."
+        echo "$message" >&2
+        command -v notify-send > /dev/null && notify-send "$message"
+        exit 1
+    fi
+    ln -sfn -- "$dir/store" "$link" || exit 1
+fi
+exec "$link/@ENTRY@" "$@"
