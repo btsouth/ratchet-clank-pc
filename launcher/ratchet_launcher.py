@@ -75,7 +75,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         page = Adw.PreferencesPage()
 
         game = Adw.PreferencesGroup(title="Game", description=(
-            "Your own dump of the European release, CUSA01073 version 01.00"))
+            "Your own dump of version 01.00: CUSA01073 (Europe, tested) or CUSA01047 (US)"))
         self.game_row = Adw.ActionRow(title="Game folder")
         self.game_status = Gtk.Image()
         self.game_row.add_suffix(self.game_status)

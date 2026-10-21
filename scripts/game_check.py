@@ -156,8 +156,9 @@ def explain(kind, title, version):
         'ratchet_version': f'{found} The Ratchet & Clank port runs version 01.00 of the European '
                            'release (CUSA01073) without updates. Dump the base game again and do '
                            'not merge an update into it.',
-        'ratchet_untested': f'{found} This release has not been tested; the port is made for the '
-                            'European release CUSA01073 1.00. It may fail to start or crash.',
+        'ratchet_untested': f'{found} This release has not been tested yet. The port was made with '
+                            'the European release CUSA01073 1.00 and applies its frame rate '
+                            'patches where the code matches it. Please report how it runs.',
         'ratchet_image': f'{found} This eboot.bin is not the one the port was made for (CUSA01073 '
                          '1.00). It may fail to start or crash; a clean dump of the base game helps.',
         'lbp3_untested': f'{found} This executable of LittleBigPlanet 3 has not been tested; '
