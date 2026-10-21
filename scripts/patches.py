@@ -323,7 +323,7 @@ def compile_external(selected, segments):
 # (interval - 0.5) periods after the last flip: it counts on flips landing on vblank ticks of the
 # preset's rate. At another vblank rate (240 Hz flips at once) interval 1 waited half a frame and
 # "60" ran at ~68 FPS; there the preset is interval 0 and the port's limiter (ratchet_pacing).
-RATCHET_IDS={'CUSA01073'}
+RATCHET_IDS={'CUSA01073','CUSA01047'} # EU, US (untested: patched only where its code matches 1.00)
 RATCHET_FPS={'30':None,'60':1.0,'90':59.94/90,'120':59.94/120,'uncap':0.0}
 RATCHET_INTERVAL_SITE=0x1722f6e
 RATCHET_INTERVAL_CODE=bytes.fromhex('4189461c8b4628be080000004c89ff41894620')

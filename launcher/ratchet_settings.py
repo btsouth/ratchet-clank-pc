@@ -162,7 +162,7 @@ def game_status(path):
     title, version = info.get("TITLE_ID", "?"), info.get("APP_VER", "?")
     if title != game_check.RATCHET_TITLE and title not in game_check.RATCHET_UNTESTED_TITLES:
         return "error", (f"This is not Ratchet & Clank (found {title}, sce_sys/param.sfo). The port "
-                         "runs the European release CUSA01073, version 01.00.")
+                         "runs CUSA01073 (Europe) or CUSA01047 (US), version 01.00.")
     found = game_check.problem(path)
     if found is None:
         return "ok", f"Ratchet & Clank {title}, version {version}"

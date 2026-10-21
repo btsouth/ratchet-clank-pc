@@ -6,7 +6,7 @@
 
 namespace Game {
 namespace {
-constexpr const char* Serials[] = {"CUSA01073"};
+constexpr const char* Serials[] = {"CUSA01073", "CUSA01047"}; // EU, US (untested)
 
 /// The TAA resolve (compute 4595ddd5, 240x135 groups of 8x8) reads the scene color, the motion
 /// vectors at the nearest-depth pixel, linear depth and its history, and writes new history;

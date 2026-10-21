@@ -26,9 +26,11 @@ Reports from other GPUs and distributions are very welcome (see
 
 - Linux on an x86-64 PC and a GPU with Vulkan 1.3. NVIDIA RTX is the tested setup. AMD and Intel
   GPUs should work but have had little or no testing.
-- A dump of **Ratchet & Clank, European release CUSA01073, version 01.00**, with no update merged
-  into it. The game folder holds `eboot.bin`, `sce_module/` and `sce_sys/`.
-  - The US release (CUSA01047) has not been tried. The launcher lets you start it with a warning.
+- A dump of **Ratchet & Clank version 01.00** with no update merged into it. The European release
+  CUSA01073 is the tested one. The game folder holds `eboot.bin`, `sce_module/` and `sce_sys/`.
+  - The US release (CUSA01047) should work too but has not been tried, as nobody on the project
+    has a US copy. It gets the same treatment; its frame rate patches apply only where its code
+    matches the European 1.00. Reports are welcome.
   - Updates (1.01 and later) are not supported: the port's patches use the 1.00 addresses.
 - About 30 GB of disk space for the game, plus a few GB for the shader cache.
 
@@ -39,8 +41,8 @@ You need a jailbroken PS4 and your own copy of the game, on disc or bought digit
 1. Dump the game with a PS4 dumper of your choice, or back up its package file.
 2. If you have a `.pkg`, extract it with a PKG extractor (the shadPS4 docs list a few). Use a
    recent tool: some old extractors leave parts of compressed files stale.
-3. You should end up with a folder named `CUSA01073` that contains `eboot.bin`. Point the launcher
-   at that folder.
+3. You should end up with a folder named `CUSA01073` (US: `CUSA01047`) that contains `eboot.bin`.
+   Point the launcher at that folder.
 
 Do not ask for game files in this project's issues. They will be closed.
 
