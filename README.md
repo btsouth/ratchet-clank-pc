@@ -147,10 +147,9 @@ start without them. Each one can still be overridden. `run.sh` explains each.
 ## Known issues
 
 - Only CUSA01073 version 01.00 is tested. The US release and updated versions are not.
-- The game's motion blur is off by default. With it on, shadows can flicker while the camera
-  turns: the blurred image sometimes misses shadows the frame has. The cause is not found yet
-  ([notes](docs/ratchet-motion-blur.md)). You can turn it back on in the launcher or the in-game
-  overlay.
+- Shadows can flicker while the camera moves. The cause is not found yet
+  ([notes](docs/ratchet-motion-blur.md)). The game's motion blur makes it much worse in some places,
+  so it is off by default; you can turn it back on in the launcher or the in-game overlay.
 - No one has played the game from start to finish on the port yet.
 - The first visit to each area stutters while shaders compile. Later visits use the cache.
 - 120 FPS is not steady yet: busy scenes run well below it on the tested PC. 60 FPS is the

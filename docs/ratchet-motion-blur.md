@@ -1,14 +1,16 @@
-# Ratchet & Clank: shadows flicker with motion blur on
+# Ratchet & Clank: shadow flicker and the motion blur
 
-Motion blur is off by default (`effect_motion_blur=0` in `bbport.ini`, the launcher's Motion blur
-switch) because of this bug. This page is what is known so far, for anyone who wants to dig in.
+Shadows flicker while the camera moves. The game's motion blur makes it much worse in some places,
+so it is off by default (`effect_motion_blur=0` in `bbport.ini`, the launcher's Motion blur
+switch), but the flicker is also seen with it off (on Veldin, for example). This page is what is
+known so far, for anyone who wants to dig in.
 
 ## What you see
 
 With motion blur on, shadows come and go between frames while the camera turns. In the sunlit
 garage, the shadow of the roof on the wall is in some frames and missing from the next. It happens
 at 30 and 60 FPS, with DLSS or the game's own TAA, and in builds back to mid October. With motion
-blur off the shadows are steady.
+blur off the shadows in that scene are steady, but shadows still flicker elsewhere.
 
 ## The game's motion blur
 
