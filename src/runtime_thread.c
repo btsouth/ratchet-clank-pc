@@ -231,11 +231,30 @@ void runtime_thread_alt_stack(void) {
     stack_t alt={.ss_sp=malloc(ALT_STACK),.ss_size=ALT_STACK};
     if (alt.ss_sp) sigaltstack(&alt,NULL);
 }
+/* Guest threads start with the PS4's FPU state: MXCSR 0x9fc0 (flush to zero, denormals are zero)
+ * and the x87 control word 0x037f. The game's fibers (sceFiber) already start with it, so a job could
+ * compute differently on a fiber than on a thread. The host default is 0x1f80.
+ * BB_GUEST_MXCSR=<hex> picks another value; BB_GUEST_MXCSR=1f80 restores the host default. */
+static void set_guest_fpu(void) {
+    static unsigned value=0x9fc0;
+    static int once;
+    if (!once) {
+        const char *env=getenv("BB_GUEST_MXCSR");
+        if (env) value=(unsigned)strtoul(env,NULL,16);
+        once=1;
+    }
+    if (!value) return;
+    uint32_t mxcsr=value;
+    uint16_t fpucw=0x037f;
+    __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+    __asm__ volatile("fldcw %0" : : "m"(fpucw));
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     runtime_thread_alt_stack();
     attach(t);
     set_host_name(t->name);
+    set_guest_fpu();
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
