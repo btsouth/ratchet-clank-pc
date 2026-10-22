@@ -614,6 +614,7 @@ void RunGpuClockCopy(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const u64 value = GetGpuClock64();
     if (!rasterizer.WriteDataOnGpu(target, &value, sizeof(value))) {
         std::memcpy(reinterpret_cast<void*>(target), &value, sizeof(value));
+        rasterizer.NoteHostWrite(target, sizeof(value));
     }
 }
 
@@ -816,6 +817,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 rasterizer->NoteCommandWriteInOrder(dump_const->Address<VAddr>(),
                                                     cblock.constants_heap.data() + dump_const->Offset(),
                                                     dump_const->Size());
+            } else if (rasterizer) {
+                rasterizer->NoteHostWrite(dump_const->Address<VAddr>(), dump_const->Size());
             }
             break;
         }
@@ -2224,7 +2227,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 g_gfx_wait.End();
                 // bbport: the guest may have written memory for the draws after this wait
                 // (BB_HOT_PAGES: hot pages count as modified again).
-                BbStats::upload_epoch.fetch_add(1, std::memory_order_relaxed);
+                BbStats::NewUploadEpoch();
                 if (dcb_stats) {
                     ++g_dcb_stats.wait_outcome[met ? 2 : 3];
                     g_dcb_stats.wait_ms += std::chrono::duration<double, std::milli>(
@@ -2630,7 +2633,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
             }
             g_asc_wait.End();
-            BbStats::upload_epoch.fetch_add(1, std::memory_order_relaxed); // as on the gfx queue
+            BbStats::NewUploadEpoch(); // as on the gfx queue
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
@@ -2774,6 +2777,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     // the GPU thread needs to pick up work.
     auto* draw_prep = rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
     auto prep_submission = draw_prep ? draw_prep->Build(dcb) : nullptr;
+    // Before the GPU thread can see the submission: its packets must carry an epoch after the
+    // guest's writes for it (an older one would take an earlier scan as fresh).
+    NoteGuestSubmit();
     {
         // Numbering, enqueueing and queueing under one lock keep the three orders identical.
         std::scoped_lock lock{queue.m_access};
@@ -2845,6 +2851,14 @@ void Liverpool::SignalGpuIdle(u64 generation) {
     }
 }
 
+// bbport (async write tracking): the guest wrote what a submission reads before submitting it,
+// so buffer regions are scanned again at their next use from here on (RegionManager).
+void Liverpool::NoteGuestSubmit() {
+    if (BbStats::async_write_tracking.load(std::memory_order_relaxed)) {
+        BbStats::NewUploadEpoch();
+    }
+}
+
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     BbStats::asc_submits.fetch_add(1, std::memory_order_relaxed);
@@ -2852,6 +2866,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
+    NoteGuestSubmit(); // before the queue sees it, as in SubmitGfx
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

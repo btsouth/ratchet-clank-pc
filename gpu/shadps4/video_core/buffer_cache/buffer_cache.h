@@ -211,6 +211,8 @@ public:
     /// the backing mapping, which nothing sees). Where VRAM holds a copy of them it gets them too, at
     /// the next binding.
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size);
+    /// bbport (async write tracking): see Rasterizer::NoteHostWrite.
+    void NoteHostWrite(VAddr addr, u64 size);
     /// bbport, without write tracking (any thread): the CPU wrote [addr, addr + size) next to data
     /// the GPU keeps in VRAM. Exactly those bytes are copied into VRAM from the game's memory at the
     /// next binding: no readback of the GPU's data, nothing uploaded over it.

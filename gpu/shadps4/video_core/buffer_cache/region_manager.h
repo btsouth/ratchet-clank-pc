@@ -7,6 +7,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <utility>
+#include <vector>
+#include <x86intrin.h>
 
 #include "bbport_toggles.h"
 #include "game_profile.h"
@@ -122,6 +125,11 @@ public:
         } else {
             if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
                 UpdateProtection<enable, true>();
+            }
+            // bbport: async write tracking: GPU-written pages are page-protected (see
+            // UpdateWriteProtection).
+            if (tracker->AsyncWrites()) {
+                UpdateWriteProtection();
             }
             // bbport: a hot page the GPU writes is protected again, so a guest write to it is
             // seen (and the GPU's data is not overwritten by an upload of the guest's copy).
@@ -270,9 +278,214 @@ public:
         preupload_frame = 0;
     }
 
+    /// bbport (async write tracking): whether the pages were scanned in `epoch` (guest
+    /// submission or wait) or later and no GPU-side write came since. Read without the lock.
+    [[nodiscard]] bool AsyncFresh(u64 epoch) const noexcept {
+        return scan_epoch.load(std::memory_order_acquire) >= epoch;
+    }
+    /// TSC of the last scan.
+    [[nodiscard]] u64 AsyncScanTsc() const noexcept {
+        return scan_tsc.load(std::memory_order_relaxed);
+    }
+    /// TSC of the last scan or host write that found pages left to scans written.
+    [[nodiscard]] u64 AsyncWriteTsc() const noexcept {
+        return write_tsc.load(std::memory_order_relaxed);
+    }
+    /// The GPU side used the region in `epoch`: the scanner thread keeps it scanned (true: it
+    /// was not on its list).
+    bool NoteAsyncUse(u64 epoch) noexcept {
+        if (use_epoch.load(std::memory_order_relaxed) != epoch) {
+            use_epoch.store(epoch, std::memory_order_relaxed);
+        }
+        return !async_listed.load(std::memory_order_relaxed) &&
+               !async_listed.exchange(true, std::memory_order_acq_rel);
+    }
+    [[nodiscard]] u64 AsyncUseEpoch() const noexcept {
+        return use_epoch.load(std::memory_order_relaxed);
+    }
+    void AsyncUnlist() noexcept {
+        async_listed.store(false, std::memory_order_release);
+    }
+    /// A write the GPU side made itself (command processor writes), with the lock held: its
+    /// pages are CPU-modified now, as a write fault would have marked them.
+    void NoteHostWrite(VAddr addr, u64 size) {
+        if (!async_covered) {
+            return; // page protection (a write fault) saw it
+        }
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        runs.assign(1, {addr, addr + size});
+        MarkAsyncWritten(~writeable & ~sync, runs);
+    }
+
+    /// bbport (async write tracking), with the lock held: the pages written since the last
+    /// scan become CPU-modified, as a write fault would have marked them.
+    void ScanAsyncWrites(u64 epoch, u64 now) {
+        // Fresh only once the written pages are marked (a thread that finds it fresh reads the
+        // CPU bits without the lock).
+        ScanAsyncWritesNow();
+        scan_tsc.store(now, std::memory_order_relaxed);
+        scan_epoch.store(epoch, std::memory_order_release);
+    }
+
+    /// Batched scans (MemoryTracker::AsyncScanner), with the lock held: whether the region has
+    /// pages a scan must look at; if not, it counts as scanned now.
+    bool BeginAsyncScan(u64 epoch, u64 now) {
+        RefreshAsyncCoverage();
+        if ((~writeable & ~sync).Any()) {
+            return true;
+        }
+        scan_tsc.store(now, std::memory_order_relaxed);
+        scan_epoch.store(epoch, std::memory_order_release);
+        return false;
+    }
+    /// After BeginAsyncScan returned true: `runs` are the written pages of a scan covering it.
+    void FinishAsyncScan(const std::vector<std::pair<VAddr, VAddr>>& runs, u64 epoch, u64 now) {
+        MarkAsyncWritten(~writeable & ~sync, runs);
+        scan_tsc.store(now, std::memory_order_relaxed);
+        scan_epoch.store(epoch, std::memory_order_release);
+    }
+
     LockType lock;
 
 private:
+    void ScanAsyncWritesNow() {
+        RefreshAsyncCoverage();
+        const RegionBits async_pages = ~writeable & ~sync;
+        if (async_pages.None()) {
+            return;
+        }
+        const size_t first = async_pages.FirstRange().first;
+        const size_t last = async_pages.LastRange().second;
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        runs.clear();
+        const u64 t0 = __rdtsc();
+        if (!tracker->ScanWritten(cpu_addr + first * TRACKER_BYTES_PER_PAGE,
+                                  (last - first) * TRACKER_BYTES_PER_PAGE, runs)) {
+            // Not registered any more (an unmap), or the kernel refused: everything counts.
+            BbStats::async_scan_failures.fetch_add(1, std::memory_order_relaxed);
+            runs.assign(1, {cpu_addr + first * TRACKER_BYTES_PER_PAGE,
+                            cpu_addr + last * TRACKER_BYTES_PER_PAGE});
+        }
+        BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
+        BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        MarkAsyncWritten(async_pages, runs);
+    }
+
+    /// Pages of `async_pages` within `runs` (written pages) become CPU-modified.
+    u64 MarkAsyncWritten(const RegionBits& async_pages,
+                         const std::vector<std::pair<VAddr, VAddr>>& runs) {
+        bool any = false;
+        u64 marked = 0;
+        for (const auto& [from, to] : runs) {
+            if (to <= cpu_addr || from >= cpu_addr + TRACKER_HIGHER_PAGE_SIZE) {
+                continue;
+            }
+            const size_t start = (std::max(from, cpu_addr) - cpu_addr) / TRACKER_BYTES_PER_PAGE;
+            const size_t end = std::min<size_t>(
+                Common::DivCeil(to - cpu_addr, TRACKER_BYTES_PER_PAGE), NUM_PAGES_PER_REGION);
+            if (start >= end) {
+                continue;
+            }
+            const RegionBits hit(async_pages, start, end);
+            if (hit.None()) {
+                continue;
+            }
+            if (!any) {
+                NoteCpuBits();
+                any = true;
+            }
+            cpu |= hit;
+            for (const auto& [a, b] : hit) {
+                BbStats::async_written_pages.fetch_add(b - a, std::memory_order_relaxed);
+                marked += b - a;
+            }
+        }
+        if (any) {
+            write_tsc.store(__rdtsc(), std::memory_order_relaxed);
+            last_cpu_write_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+            NotePreuploadChurn();
+            UpdateWriteProtection();
+        }
+        return marked;
+    }
+
+    /// Whether the region's memory is registered for async tracking (rechecked when GPU
+    /// memory is mapped or unmapped). Where it is not, every protected page is page-protected.
+    bool RefreshAsyncCoverage() {
+        const u64 generation = tracker->AsyncGeneration();
+        if (generation == async_generation) {
+            return async_covered;
+        }
+        async_generation = generation;
+        const bool covered = tracker->AsyncCovered(cpu_addr, TRACKER_HIGHER_PAGE_SIZE);
+        if (covered == async_covered) {
+            return covered;
+        }
+        if (async_covered) {
+            // Unregistered meanwhile: what the still registered part saw is taken first, the
+            // rest counts as written (the scan fails there).
+            async_covered = false;
+            const RegionBits async_pages = ~writeable & ~sync;
+            if (async_pages.Any()) {
+                thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+                runs.clear();
+                if (!tracker->ScanWritten(cpu_addr, TRACKER_HIGHER_PAGE_SIZE, runs)) {
+                    runs.assign(1, {cpu_addr, cpu_addr + TRACKER_HIGHER_PAGE_SIZE});
+                }
+                MarkAsyncWritten(async_pages, runs);
+            }
+        }
+        async_covered = covered;
+        UpdateWriteProtection();
+        return covered;
+    }
+
+    /// bbport (async write tracking): protected pages (no CPU modification) are page-protected
+    /// (`sync`) where a write must be seen when it happens: pages the GPU wrote (their data is
+    /// read back before the guest's bytes land) and memory not registered for async tracking.
+    /// The others are left writable and found by ScanAsyncWrites. Pages under images get page
+    /// protection from the texture cache's own watchers.
+    void UpdateWriteProtection() {
+        const RegionBits protected_pages = ~cpu;
+        const RegionBits want_sync = async_covered ? (protected_pages & gpu) : protected_pages;
+        const RegionBits was_async = ~writeable & ~sync;
+        writeable = cpu;
+        RegionBits add = want_sync & ~sync;
+        RegionBits remove = sync & ~want_sync;
+        sync = want_sync;
+        if (add.Any()) {
+            tracker->UpdatePageWatchersForRegion<true, false>(cpu_addr, add);
+        }
+        if (remove.Any()) {
+            tracker->UpdatePageWatchersForRegion<false, false>(cpu_addr, remove);
+        }
+        if (const RegionBits entering = add & was_async; async_covered && entering.Any()) {
+            CatchWritesEnteringSync(entering);
+        }
+    }
+
+    /// Pages left to scans that now get page protection (the GPU wrote them) leave the scans: a
+    /// guest write since their last scan, not reported yet, would never be uploaded. They are
+    /// protected first, then scanned: a write before the protection is found here (its page
+    /// becomes CPU-modified and writable again), a write after it faults.
+    void CatchWritesEnteringSync(const RegionBits& entering) {
+        const size_t first = entering.FirstRange().first;
+        const size_t last = entering.LastRange().second;
+        thread_local std::vector<std::pair<VAddr, VAddr>> entry_runs;
+        entry_runs.clear();
+        if (!tracker->ScanWritten(cpu_addr + first * TRACKER_BYTES_PER_PAGE,
+                                  (last - first) * TRACKER_BYTES_PER_PAGE, entry_runs)) {
+            BbStats::async_scan_failures.fetch_add(1, std::memory_order_relaxed);
+            entry_runs.assign(1, {cpu_addr + first * TRACKER_BYTES_PER_PAGE,
+                                  cpu_addr + last * TRACKER_BYTES_PER_PAGE});
+        }
+        BbStats::async_entry_scans.fetch_add(1, std::memory_order_relaxed);
+        // The scan protects again every written page in its span: the other pages left to scans
+        // there are taken too.
+        const u64 marked = MarkAsyncWritten(entering | (~writeable & ~sync), entry_runs);
+        BbStats::async_entry_pages.fetch_add(marked, std::memory_order_relaxed);
+    }
+
     /**
      * Notify tracker about changes in the CPU tracking state of a word in the buffer
      *
@@ -285,6 +498,13 @@ private:
     template <bool track, bool is_read>
     void UpdateProtection() {
         RENDERER_TRACE;
+        if constexpr (!is_read) {
+            if (tracker->AsyncWrites()) {
+                RefreshAsyncCoverage();
+                UpdateWriteProtection();
+                return;
+            }
+        }
         // bbport: hot pages stay writable whether or not they are marked modified.
         const RegionBits writable_target = num_hot ? (cpu | (hot & ~gpu)) : cpu;
         RegionBits mask = is_read ? (~gpu ^ readable) : (writable_target ^ writeable);
@@ -314,13 +534,16 @@ private:
         }();
         return enabled && !BbToggle::Disabled(BbToggle::HotPages);
     }
+    bool HotPagesActive() const {
+        return HotPagesEnabled() && !tracker->AsyncWrites();
+    }
     // A short period re-protects thousands of pages at once and each faults again before it is
     // hot, a fault storm (a 2 s period gave ~20k faults/s and frame spikes).
     static constexpr u8 HotFaults = 2;
     static constexpr auto HotPeriod = std::chrono::seconds(20);
 
     void CountWriteFaults(size_t start_page, size_t end_page) {
-        const bool hot_enabled = HotPagesEnabled();
+        const bool hot_enabled = HotPagesActive();
         static const bool streamed_only = Game::HasStreamedMemory();
         for (size_t page = start_page; page < end_page; ++page) {
             if (writeable.Get(page)) {
@@ -419,6 +642,14 @@ private:
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;
+    /// bbport (async write tracking): pages with page protection from this region (the other
+    /// protected ones are found by scans).
+    RegionBits sync;
+    std::atomic<u64> scan_epoch{0}, scan_tsc{0}, write_tsc{0};
+    std::atomic<u64> use_epoch{0};
+    std::atomic<bool> async_listed{false};
+    u64 async_generation = 0;
+    bool async_covered = false;
 };
 
 } // namespace VideoCore

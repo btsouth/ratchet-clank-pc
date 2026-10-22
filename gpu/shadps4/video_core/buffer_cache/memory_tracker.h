@@ -4,11 +4,17 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <type_traits>
+#include <thread>
+#include <time.h>
 #include <vector>
+#include <x86intrin.h>
+#include "common/thread.h"
 
 #include "bbport_toggles.h"
 #include "common/debug.h"
@@ -44,8 +50,154 @@ public:
                                (query_cpu_addr + query_size - 1) >> TRACKER_HIGHER_PAGE_BITS);
     }
 
+    /// bbport (async write tracking, PageManager::AsyncWrites): pages written since the last
+    /// scan of their 4 MiB region become CPU-modified. The work of a thread must see a scan made
+    /// in the epoch it belongs to or later (BbStats::upload_epoch: a guest submission or a met
+    /// WaitRegMem; what the guest wrote before it lets the GPU go on; the draw recording thread's
+    /// packets carry the epoch they were decoded in). The scanner thread scans the regions in use
+    /// as soon as the epoch changes, and every BB_ASYNC_WP_US besides; the caller scans the ones
+    /// it did not get to yet. The draw recording thread also rescans regions the guest is
+    /// writing that were not scanned within BB_ASYNC_REC_US.
+    void SyncAsyncWrites(VAddr query_cpu_addr, u64 query_size, bool keep_scanned = true) {
+        if (!tracker->AsyncWrites() || query_size == 0) {
+            return;
+        }
+        const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
+        const u64 required = BbStats::async_required_epoch ? BbStats::async_required_epoch : epoch;
+        // The draw recording thread runs behind the guest: a packet may read bytes the guest
+        // wrote after it was decoded with no submission or wait between (data it updates late,
+        // after the submission that reads it: a write fault saw it at the binding). Regions the
+        // guest wrote in the last BB_ASYNC_REC_ACTIVE_MS (100) must also have been scanned within
+        // the last BB_ASYNC_REC_US (300). The others (most of a binding of hundreds of MiB) are
+        // not rescanned: on the draw recording thread that was ~400k region scans a second.
+        const bool recorder = BbStats::async_required_epoch != 0;
+        const u64 now = recorder ? __rdtsc() : 0;
+        const u64 window = recorder ? RecorderWindowTicks() : 0;
+        const u64 active = recorder ? RecorderActiveTicks() : 0;
+        const auto fresh = [&](RegionManager* manager) {
+            return manager->AsyncFresh(required) &&
+                   (!recorder || now - std::min(now, manager->AsyncScanTsc()) < window ||
+                    now - std::min(now, manager->AsyncWriteTsc()) >= active);
+        };
+        // Adjacent regions to scan go in one ioctl (a binding of Ratchet & Clank's 21 MiB
+        // per-frame ranges spans six), their locks taken in address order as the scanner does.
+        std::array<RegionManager*, 16> run;
+        size_t run_size = 0;
+        const auto scan_run = [&] {
+            if (run_size == 0) {
+                return;
+            }
+            for (size_t i = 0; i < run_size; ++i) {
+                run[i]->lock.lock();
+            }
+            ScanRegions({run.data(), run_size}, fresh);
+            for (size_t i = 0; i < run_size; ++i) {
+                run[i]->lock.unlock();
+            }
+            run_size = 0;
+        };
+        const u64 last = (query_cpu_addr + query_size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        for (u64 index = query_cpu_addr >> TRACKER_HIGHER_PAGE_BITS; index <= last; ++index) {
+            auto* manager = top_tier[index];
+            if (!manager) {
+                scan_run();
+                continue;
+            }
+            if (keep_scanned && manager->NoteAsyncUse(epoch)) {
+                ListForScanner(manager);
+            }
+            if (fresh(manager)) {
+                scan_run();
+                continue;
+            }
+            if (manager->AsyncFresh(required)) {
+                BbStats::async_window_scans.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (run_size == run.size()) {
+                scan_run();
+            }
+            run[run_size++] = manager;
+        }
+        scan_run();
+    }
+
+    /// With the regions' locks held (adjacent regions, in address order): the ones still not
+    /// fresh are scanned in one ioctl. Every region in the span the ioctl covers takes part (it
+    /// protects the written pages of all of them again).
+    template <typename Fresh>
+    void ScanRegions(std::span<RegionManager*> regions, const Fresh& fresh) {
+        const u64 epoch = BbStats::upload_epoch.load(std::memory_order_acquire);
+        const u64 now = __rdtsc();
+        thread_local std::vector<RegionManager*> active;
+        thread_local std::vector<std::pair<VAddr, VAddr>> runs;
+        active.clear();
+        bool any = false;
+        for (auto* manager : regions) {
+            any = any || !fresh(manager);
+        }
+        if (!any) {
+            return;
+        }
+        for (auto* manager : regions) {
+            BbStats::async_inline_scans.fetch_add(1, std::memory_order_relaxed);
+            if (BbStats::async_required_epoch) {
+                BbStats::async_recorder_scans.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (manager->BeginAsyncScan(epoch, now)) {
+                active.push_back(manager);
+            }
+        }
+        if (active.empty()) {
+            return;
+        }
+        runs.clear();
+        const VAddr from = active.front()->GetCpuAddr();
+        const VAddr to = active.back()->GetCpuAddr() + TRACKER_HIGHER_PAGE_SIZE;
+        const u64 t0 = __rdtsc();
+        const bool ok = tracker->ScanWritten(from, to - from, runs);
+        BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
+        BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        for (auto* manager : active) {
+            if (ok) {
+                manager->FinishAsyncScan(runs, epoch, now);
+            } else {
+                manager->ScanAsyncWrites(epoch, now); // on its own: which one failed
+            }
+        }
+    }
+
+    static u64 RecorderWindowTicks() {
+        static const u64 ticks = [] {
+            const char* env = std::getenv("BB_ASYNC_REC_US");
+            const double us = env ? std::strtod(env, nullptr) : 300.0;
+            return us > 0 ? u64(us * double(BbStats::async_tsc_per_ms.load()) / 1000.0) : ~0ull;
+        }();
+        return ticks;
+    }
+    static u64 RecorderActiveTicks() {
+        static const u64 ticks = [] {
+            const char* env = std::getenv("BB_ASYNC_REC_ACTIVE_MS");
+            const double ms = env ? std::strtod(env, nullptr) : 100.0;
+            return ms > 0 ? u64(ms * double(BbStats::async_tsc_per_ms.load())) : ~0ull;
+        }();
+        return ticks;
+    }
+
+    /// bbport (async write tracking): the GPU side wrote [addr, addr + size) itself (command
+    /// processor writes): those pages are CPU-modified, as a write fault would have marked them.
+    void NoteHostWrite(VAddr addr, u64 size) {
+        if (!tracker->AsyncWrites() || size == 0) {
+            return;
+        }
+        IteratePages<false>(addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->NoteHostWrite(manager->GetCpuAddr() + offset, size);
+        });
+    }
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        SyncAsyncWrites(query_cpu_addr, query_size);
         if (!BbToggle::Disabled(BbToggle::LockFreeUploadCheck) &&
             !MaybeCpuModified(query_cpu_addr, query_size)) {
             return false;
@@ -64,6 +216,7 @@ public:
         if (!manager) {
             return !rewritten; // never used by the GPU: all of it is CPU-modified
         }
+        SyncAsyncWrites(region_addr, TRACKER_HIGHER_PAGE_SIZE, false);
         std::scoped_lock lk{manager->lock};
         if (rewritten && manager->last_cpu_write_frame == 0) {
             return false;
@@ -146,6 +299,7 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        SyncAsyncWrites(query_cpu_range, query_size);
         // bbport: a write binding over pages the CPU did not change and the GPU already owns
         // needs neither an upload nor a state change (it ran under the region lock for every
         // GPU write binding, twice per page). Racing guest writes are as in the read path.
@@ -167,8 +321,16 @@ public:
                 return;
             }
         }
+        // Async write tracking: a GPU write binding makes its pages GPU-owned before the upload.
+        // They get page protection and are scanned after it (RegionManager::
+        // CatchWritesEnteringSync), so a guest write not reported yet is uploaded now, before the
+        // GPU writes there; a later one faults. (Precise readbacks read-protect GPU pages, which
+        // the upload reads: there the order stays.)
+        const bool gpu_first = is_written && tracker->AsyncWrites() &&
+                               EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
         IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                           [&func, is_written, gpu_first](RegionManager* manager, u64 offset,
+                                                          size_t size) {
                                // bbport: read-only bindings skip the region lock when no page
                                // in range is CPU-modified. A guest write sets its bit in the
                                // fault handler before the store, and the draw that uses the
@@ -179,6 +341,10 @@ public:
                                    return;
                                }
                                manager->lock.lock();
+                               if (gpu_first) {
+                                   manager->template ChangeRegionState<Type::GPU, true>(
+                                       manager->GetCpuAddr() + offset, size);
+                               }
                                manager->template ForEachModifiedRange<Type::CPU, true>(
                                    manager->GetCpuAddr() + offset, size, func);
                                if (!is_written) {
@@ -190,9 +356,11 @@ public:
             return;
         }
         IteratePages<false>(query_cpu_range, query_size,
-                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
-                                manager->template ChangeRegionState<Type::GPU, true>(
-                                    manager->GetCpuAddr() + offset, size);
+                            [gpu_first](RegionManager* manager, u64 offset, size_t size) {
+                                if (!gpu_first) {
+                                    manager->template ChangeRegionState<Type::GPU, true>(
+                                        manager->GetCpuAddr() + offset, size);
+                                }
                                 manager->lock.unlock();
                             });
     }
@@ -209,6 +377,152 @@ public:
     }
 
 private:
+    void ListForScanner(RegionManager* manager) {
+        std::scoped_lock lk{async_mutex};
+        async_regions.push_back(manager);
+        async_regions_changed.store(true, std::memory_order_release);
+        if (!async_scanner.joinable()) {
+            async_scanner = std::jthread([this](std::stop_token stop) { AsyncScanner(stop); });
+        }
+    }
+
+    /// bbport (async write tracking): scans the regions the GPU side uses as soon as a new
+    /// epoch starts, off the draw recording thread (which then finds them scanned), and every
+    /// BB_ASYNC_WP_US besides (writes the guest makes without a submission in between are then
+    /// seen within about that time too). A scan costs mostly per ioctl (~1 us), little per page
+    /// (~0.3 ns), so adjacent regions are scanned together, with their locks held.
+    void AsyncScanner(std::stop_token stop) {
+        Common::SetCurrentThreadName("bb:AsyncScan");
+        // Regions used in the last two frames: the next submissions use them too. Passes come
+        // at most every PassUs: a pass covers all epochs started since the last one (the draw
+        // recording thread lags behind them; it needs a scan from its packet's epoch on).
+        constexpr u64 PassUs = 400;
+        u64 recent_epochs = 256;
+        u32 seen_frame = 0;
+        std::array<u64, 3> frame_epochs{};
+        constexpr u64 ForgetEpochs = 4096;  // seconds of submissions without a use
+        constexpr size_t MaxGroup = 64;     // regions per ioctl (256 MiB)
+        std::vector<RegionManager*> regions, group, active;
+        std::vector<std::pair<VAddr, VAddr>> runs;
+        u64 scanned_epoch = 0, pass_tsc = 0;
+        const u64 max_age = tracker->AsyncMaxAgeTicks();
+        const u64 tsc_per_us = std::max<u64>(1, BbStats::async_tsc_per_ms.load() / 1000);
+        std::stop_callback wake_on_stop(stop, [] {
+            BbStats::async_wake.fetch_add(1);
+            syscall(SYS_futex, reinterpret_cast<u32*>(&BbStats::async_wake), FUTEX_WAKE_PRIVATE,
+                    1, nullptr, nullptr, 0);
+        });
+        const auto scan_group = [&](u64 epoch, u64 now) {
+            for (auto* manager : group) {
+                manager->lock.lock();
+            }
+            active.clear();
+            for (auto* manager : group) {
+                if (manager->BeginAsyncScan(epoch, now)) {
+                    active.push_back(manager);
+                }
+            }
+            if (!active.empty()) {
+                runs.clear();
+                const VAddr from = active.front()->GetCpuAddr();
+                const VAddr to = active.back()->GetCpuAddr() + TRACKER_HIGHER_PAGE_SIZE;
+                const u64 t0 = __rdtsc();
+                const bool ok = tracker->ScanWritten(from, to - from, runs);
+                BbStats::async_scans.fetch_add(1, std::memory_order_relaxed);
+                BbStats::async_scan_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+                for (auto* manager : active) {
+                    if (ok) {
+                        manager->FinishAsyncScan(runs, epoch, now);
+                    } else {
+                        manager->ScanAsyncWrites(epoch, now); // on its own: which one failed
+                    }
+                }
+            }
+            for (auto* manager : group) {
+                manager->lock.unlock();
+            }
+            group.clear();
+        };
+        while (!stop.stop_requested()) {
+            const u32 wake = BbStats::async_wake.load(std::memory_order_acquire);
+            BbStats::async_scanner_idle.store(true, std::memory_order_seq_cst);
+            const u64 epoch = BbStats::upload_epoch.load(std::memory_order_seq_cst);
+            const u64 now = __rdtsc();
+            const u64 since = now - pass_tsc;
+            if (epoch == scanned_epoch && since < max_age) {
+                // Until the next epoch (NewUploadEpoch wakes this) or the next age pass.
+                const u64 left_us =
+                    max_age == ~0ull ? 100'000 : std::max<u64>(1, (max_age - since) / tsc_per_us);
+                timespec timeout{s64(left_us / 1'000'000), s64(left_us % 1'000'000) * 1000};
+                syscall(SYS_futex, reinterpret_cast<u32*>(&BbStats::async_wake), FUTEX_WAIT_PRIVATE,
+                        wake, &timeout, nullptr, 0);
+                continue;
+            }
+            BbStats::async_scanner_idle.store(false, std::memory_order_relaxed);
+            if (since < PassUs * tsc_per_us) {
+                // A new epoch soon after the last pass: the next pass takes it with the ones after.
+                timespec pause{0, s64((PassUs * tsc_per_us - since) / tsc_per_us) * 1000};
+                nanosleep(&pause, nullptr);
+                continue;
+            }
+            const bool aged = epoch == scanned_epoch;
+            scanned_epoch = epoch;
+            if (const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+                frame != seen_frame) {
+                seen_frame = frame;
+                frame_epochs = {epoch, frame_epochs[0], frame_epochs[1]};
+                if (frame_epochs[2] != 0) {
+                    recent_epochs = std::clamp<u64>(epoch - frame_epochs[2], 16, 4096);
+                }
+            }
+            pass_tsc = now;
+            if (async_regions_changed.exchange(false, std::memory_order_acq_rel)) {
+                std::scoped_lock lk{async_mutex};
+                regions = async_regions;
+                std::sort(regions.begin(), regions.end(), [](auto* a, auto* b) {
+                    return a->GetCpuAddr() < b->GetCpuAddr();
+                });
+            }
+            bool forget = false;
+            for (auto* manager : regions) {
+                const u64 used = epoch - std::min(epoch, manager->AsyncUseEpoch());
+                if (used > ForgetEpochs) {
+                    forget = true;
+                    continue;
+                }
+                const bool due = used <= recent_epochs &&
+                                 (aged ? now - manager->AsyncScanTsc() >= max_age
+                                       : !manager->AsyncFresh(epoch));
+                if (!due) {
+                    continue;
+                }
+                if (aged) {
+                    BbStats::async_age_scans.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!group.empty() &&
+                    (group.size() == MaxGroup ||
+                     group.back()->GetCpuAddr() + TRACKER_HIGHER_PAGE_SIZE != manager->GetCpuAddr())) {
+                    scan_group(epoch, now);
+                }
+                group.push_back(manager);
+            }
+            if (!group.empty()) {
+                scan_group(epoch, now);
+            }
+            if (forget) {
+                std::scoped_lock lk{async_mutex};
+                std::erase_if(async_regions, [&](RegionManager* manager) {
+                    if (epoch - std::min(epoch, manager->AsyncUseEpoch()) <= ForgetEpochs) {
+                        return false;
+                    }
+                    manager->AsyncUnlist();
+                    return true;
+                });
+                async_regions_changed.store(true, std::memory_order_release);
+            }
+        }
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address
@@ -277,6 +591,10 @@ private:
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
     RegionSummary<NUM_HIGH_PAGES> cpu_summary;
+    std::mutex async_mutex;
+    std::vector<RegionManager*> async_regions;
+    std::atomic<bool> async_regions_changed{false};
+    std::jthread async_scanner; ///< last: stopped and joined before the members it reads go
 };
 
 } // namespace VideoCore

@@ -106,6 +106,12 @@ public:
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size) {
         buffer_cache.NoteLateCommandWrite(addr, data, size);
     }
+    /// bbport (async write tracking): the GPU side wrote [addr, addr + size) of guest memory with
+    /// the CPU, in decode order. Without page protection there is no write fault: the pages are
+    /// marked CPU-modified here instead.
+    void NoteHostWrite(VAddr addr, u64 size) {
+        buffer_cache.NoteHostWrite(addr, size);
+    }
     /// bbport: the command processor wrote `size` bytes of `data` at addr with the CPU in decode order
     /// (WriteData, a constant RAM dump; the decoder reads them there). Where the GPU's own data there
     /// is in VRAM the bytes go into it in stream order, else the caches are invalidated (no write

@@ -94,6 +94,16 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }
+    // bbport: a tiling compositor (Hyprland) can map the window tiled with the fullscreen request
+    // dropped (a 1278x1399 half of a 2560x1440 screen). Once it is mapped, fullscreen is asked
+    // for again.
+    if (fullscreen && fullscreen[0] == '1') {
+        SDL_SyncWindow(window);
+        if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)) {
+            SDL_SetWindowFullscreen(window, true);
+            SDL_SyncWindow(window);
+        }
+    }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
