@@ -234,8 +234,9 @@ void runtime_thread_alt_stack(void) {
 /* Guest threads start with the PS4's FPU state: MXCSR 0x9fc0 (flush to zero, denormals are zero)
  * and the x87 control word 0x037f. The game's fibers (sceFiber) already start with it, so a job could
  * compute differently on a fiber than on a thread. The host default is 0x1f80.
- * BB_GUEST_MXCSR=<hex> picks another value; BB_GUEST_MXCSR=1f80 restores the host default. */
-static void set_guest_fpu(void) {
+ * BB_GUEST_MXCSR=<hex> picks another value; BB_GUEST_MXCSR=1f80 restores the host default.
+ * The main thread gets it from probe.c before the game's modules start. */
+void runtime_thread_guest_fpu(void) {
     static unsigned value=0x9fc0;
     static int once;
     if (!once) {
@@ -254,7 +255,7 @@ static void *host_start(void *p) {
     runtime_thread_alt_stack();
     attach(t);
     set_host_name(t->name);
-    set_guest_fpu();
+    runtime_thread_guest_fpu();
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -425,6 +426,7 @@ void runtime_thread_report(void) {
 uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
 void runtime_thread_report(void) {}
 void runtime_thread_attach_main(void) {}
+void runtime_thread_guest_fpu(void) {}
 void runtime_thread_alt_stack(void) {}
 void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
 #endif
